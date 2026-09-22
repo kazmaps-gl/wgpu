@@ -43,3 +43,30 @@ impl NavigatorGpu for web_sys::WorkerNavigator {
         extension.gpu()
     }
 }
+
+// --- Bindings for `GPUPipelineError` ---
+
+/// The rejection value of `GPUDevice.createRenderPipelineAsync()`.
+///
+/// Not part of the `webgpu_sys` bindings vendored from `web-sys`, hence the hand-written
+/// binding here. It extends `js_sys::Object` rather than `web_sys::DomException`, which it
+/// derives from in the specification, because wgpu does not enable the `DomException`
+/// feature of `web-sys`.
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(
+        extends = ::js_sys::Object,
+        js_name = "GPUPipelineError",
+        typescript_type = "GPUPipelineError"
+    )]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub type GpuPipelineError;
+
+    /// Getter for the `message` field of this object.
+    #[wasm_bindgen(method, getter, js_class = "GPUPipelineError", js_name = "message")]
+    pub fn message(this: &GpuPipelineError) -> ::alloc::string::String;
+
+    /// Getter for the `reason` field of this object: `"validation"` or `"internal"`.
+    #[wasm_bindgen(method, getter, js_class = "GPUPipelineError", js_name = "reason")]
+    pub fn reason(this: &GpuPipelineError) -> ::alloc::string::String;
+}
