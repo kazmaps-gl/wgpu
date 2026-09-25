@@ -1351,9 +1351,12 @@ impl super::Queue {
                 buffer,
                 ref buffer_desc,
                 attribute_desc: ref vat,
+                configure,
             } => {
                 unsafe { gl.bind_buffer(glow::ARRAY_BUFFER, buffer) };
-                unsafe { gl.enable_vertex_attrib_array(vat.location) };
+                if configure {
+                    unsafe { gl.enable_vertex_attrib_array(vat.location) };
+                }
 
                 if buffer.is_none() {
                     match vat.format_desc.attrib_kind {
@@ -1401,7 +1404,9 @@ impl super::Queue {
                             )
                         },
                     }
-                    unsafe { gl.vertex_attrib_divisor(vat.location, buffer_desc.step as u32) };
+                    if configure {
+                        unsafe { gl.vertex_attrib_divisor(vat.location, buffer_desc.step as u32) };
+                    }
                 }
             }
             C::UnsetVertexAttribute(location) => {

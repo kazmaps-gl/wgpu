@@ -1048,6 +1048,9 @@ enum Command {
         buffer: Option<glow::Buffer>,
         buffer_desc: VertexBufferDesc,
         attribute_desc: AttributeDesc,
+        /// Also enable the array and set its divisor. `false` when the encoder knows both
+        /// are already current for this location, so only the pointer is re-specified.
+        configure: bool,
     },
     UnsetVertexAttribute(u32),
     SetVertexBuffer {
