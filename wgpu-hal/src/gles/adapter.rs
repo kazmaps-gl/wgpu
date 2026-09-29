@@ -1088,6 +1088,16 @@ impl crate::Adapter for super::Adapter {
         let main_vao =
             unsafe { gl.create_vertex_array() }.map_err(|_| crate::DeviceError::OutOfMemory)?;
         unsafe { gl.bind_vertex_array(Some(main_vao)) };
+        let spare_vao =
+            unsafe { gl.create_vertex_array() }.map_err(|_| crate::DeviceError::OutOfMemory)?;
+        let vertex_arrays = Arc::new(Mutex::new(super::vertex_array::VertexArrays::new(
+            !self
+                .shared
+                .private_caps
+                .contains(super::PrivateCapabilities::VERTEX_BUFFER_LAYOUT),
+            main_vao,
+            spare_vao,
+        )));
 
         let zero_buffer =
             unsafe { gl.create_buffer() }.map_err(|_| crate::DeviceError::OutOfMemory)?;
@@ -1115,7 +1125,7 @@ impl crate::Adapter for super::Adapter {
         Ok(crate::OpenDevice {
             device: super::Device {
                 shared: Arc::clone(&self.shared),
-                main_vao,
+                vertex_arrays: Arc::clone(&vertex_arrays),
                 #[cfg(all(native, feature = "renderdoc"))]
                 render_doc: Default::default(),
                 counters: Default::default(),
@@ -1132,6 +1142,7 @@ impl crate::Adapter for super::Adapter {
                 temp_query_results: Mutex::new(Vec::new()),
                 draw_buffer_count: AtomicU8::new(1),
                 current_index_buffer: Mutex::new(None),
+                vertex_arrays,
             },
         })
     }

@@ -3,7 +3,11 @@ use core::{mem, ops::Range};
 
 use arrayvec::ArrayVec;
 
-use super::{conv, Command as C};
+use super::{
+    conv,
+    vertex_array::{AttributePointer, VertexAttribute},
+    Command as C,
+};
 
 /// A buffer binding already recorded in the current pass. WebGL2 pays a JS call per
 /// redundant `bindBufferRange`, so identical rebinds are dropped at encode time.
@@ -65,8 +69,6 @@ pub(super) struct State {
     bound_textures: [Option<BoundTexture>; super::MAX_TEXTURE_SLOTS],
     /// Sampler recorded per texture unit; the outer `None` means unknown.
     bound_samplers: [Option<Option<glow::Sampler>>; super::MAX_TEXTURE_SLOTS],
-    /// Attribute locations whose enable and divisor are current for the bound pipeline.
-    configured_attributes: u32,
 }
 
 impl State {
@@ -74,7 +76,6 @@ impl State {
         self.bound_buffers.clear();
         self.bound_textures = Default::default();
         self.bound_samplers = Default::default();
-        self.configured_attributes = 0;
     }
 }
 
@@ -108,7 +109,6 @@ impl Default for State {
             bound_buffers: Default::default(),
             bound_textures: Default::default(),
             bound_samplers: Default::default(),
-            configured_attributes: 0,
         }
     }
 }
@@ -213,21 +213,22 @@ impl super::CommandEncoder {
                         (_, _) => continue,
                     };
 
-                let mut attribute_desc = attribute.clone();
-                attribute_desc.offset += vb.offset as u32;
+                let mut offset = attribute.offset + vb.offset as u32;
                 if buffer_desc.step == wgt::VertexStepMode::Instance {
-                    attribute_desc.offset += buffer_desc.stride * first_instance;
+                    offset += buffer_desc.stride * first_instance;
                 }
-
-                let bit = 1 << attribute.location;
-                let configure = self.state.configured_attributes & bit == 0;
-                self.state.configured_attributes |= bit;
-                self.cmd_buffer.commands.push(C::SetVertexAttribute {
-                    buffer: Some(vb.raw),
-                    buffer_desc,
-                    attribute_desc,
-                    configure,
-                });
+                self.cmd_buffer
+                    .commands
+                    .push(C::SetVertexArrayAttribute(VertexAttribute {
+                        location: attribute.location,
+                        pointer: AttributePointer {
+                            buffer: vb.raw,
+                            format: attribute.format_desc.clone(),
+                            stride: buffer_desc.stride,
+                            offset,
+                        },
+                        divisor: buffer_desc.step as u32,
+                    }));
                 vbuf_mask |= 1 << attribute.buffer_index;
             }
             self.state.dirty_vbuf_mask ^= vbuf_mask;
@@ -767,10 +768,17 @@ impl crate::CommandEncoder for super::CommandEncoder {
         self.state.dirty_vbuf_mask = 0;
         self.state.active_first_instance = 0;
         self.state.color_targets.clear();
-        for vat in &self.state.vertex_attributes {
-            self.cmd_buffer
-                .commands
-                .push(C::UnsetVertexAttribute(vat.location));
+        if self
+            .private_caps
+            .contains(super::PrivateCapabilities::VERTEX_BUFFER_LAYOUT)
+        {
+            for vat in &self.state.vertex_attributes {
+                self.cmd_buffer
+                    .commands
+                    .push(C::UnsetVertexAttribute(vat.location));
+            }
+        } else {
+            self.cmd_buffer.commands.push(C::ResetVertexArray);
         }
         self.state.vertex_attributes.clear();
         self.state.primitive = super::PrimitiveState::default();
@@ -965,27 +973,27 @@ impl crate::CommandEncoder for super::CommandEncoder {
             .contains(super::PrivateCapabilities::VERTEX_BUFFER_LAYOUT)
         {
             for vat in pipeline.vertex_attributes.iter() {
-                let vb = pipeline.vertex_buffers[vat.buffer_index as usize]
-                    .as_ref()
-                    .unwrap();
                 // set the layout
-                self.cmd_buffer.commands.push(C::SetVertexAttribute {
-                    buffer: None,
-                    buffer_desc: vb.clone(),
-                    attribute_desc: vat.clone(),
-                    configure: true,
-                });
-            }
-        } else {
-            for vat in &self.state.vertex_attributes {
                 self.cmd_buffer
                     .commands
-                    .push(C::UnsetVertexAttribute(vat.location));
+                    .push(C::SetVertexAttribute(vat.clone()));
+            }
+        } else {
+            // Locations the new pipeline reads get their attribute at the next draw.
+            let next = pipeline
+                .vertex_attributes
+                .iter()
+                .fold(0u32, |mask, vat| mask | 1 << vat.location);
+            for vat in &self.state.vertex_attributes {
+                if next & (1 << vat.location) == 0 {
+                    self.cmd_buffer
+                        .commands
+                        .push(C::UnsetVertexArrayAttribute(vat.location));
+                }
             }
             self.state.vertex_attributes.clear();
 
             self.state.dirty_vbuf_mask = 0;
-            self.state.configured_attributes = 0;
             // copy vertex attributes
             for vat in pipeline.vertex_attributes.iter() {
                 //Note: we can invalidate more carefully here.
@@ -1118,9 +1126,17 @@ impl crate::CommandEncoder for super::CommandEncoder {
     ) {
         self.state.index_offset = binding.offset;
         self.state.index_format = format;
-        self.cmd_buffer
-            .commands
-            .push(C::SetIndexBuffer(binding.buffer.raw.unwrap()));
+        let raw = binding.buffer.raw.unwrap();
+        self.cmd_buffer.commands.push(
+            if self
+                .private_caps
+                .contains(super::PrivateCapabilities::VERTEX_BUFFER_LAYOUT)
+            {
+                C::SetIndexBuffer(raw)
+            } else {
+                C::SetVertexArrayIndexBuffer(raw)
+            },
+        );
     }
     unsafe fn set_vertex_buffer<'a>(
         &mut self,

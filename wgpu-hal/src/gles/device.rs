@@ -231,6 +231,9 @@ impl super::Device {
         super::Buffer {
             raw: Some(glow::NativeBuffer(name)),
             target,
+            vertex_input: desc
+                .usage
+                .intersects(wgt::BufferUses::VERTEX | wgt::BufferUses::INDEX),
             size: desc.size,
             map_flags,
             map_state: Arc::new(MaybeMutex::new(super::BufferMapState {
@@ -635,6 +638,7 @@ impl crate::Device for super::Device {
             return Ok(super::Buffer {
                 raw: None,
                 target,
+                vertex_input: false,
                 size: desc.size,
                 map_flags: 0,
                 map_state: Arc::new(MaybeMutex::new(super::BufferMapState {
@@ -739,6 +743,9 @@ impl crate::Device for super::Device {
         Ok(super::Buffer {
             raw,
             target,
+            vertex_input: desc
+                .usage
+                .intersects(wgt::BufferUses::VERTEX | wgt::BufferUses::INDEX),
             size: desc.size,
             map_flags,
             map_state: Arc::new(MaybeMutex::new(super::BufferMapState {
@@ -751,9 +758,13 @@ impl crate::Device for super::Device {
     }
 
     unsafe fn destroy_buffer(&self, buffer: super::Buffer) {
-        if buffer.drop_guard.is_none() {
-            if let Some(raw) = buffer.raw {
-                let gl = &self.shared.context.lock();
+        if let Some(raw) = buffer.raw {
+            let gl = &self.shared.context.lock();
+            // Even a buffer the owner deletes: its name may come back for another one.
+            if buffer.vertex_input {
+                unsafe { self.vertex_arrays.lock().forget_buffer(gl, raw) };
+            }
+            if buffer.drop_guard.is_none() {
                 unsafe { gl.delete_buffer(raw) };
             }
         }
