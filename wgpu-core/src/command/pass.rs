@@ -108,6 +108,15 @@ where
 
         bind_group.validate_dynamic_bindings(index, &state.temp_offsets)?;
 
+        // Engines often re-set the bound group when a new layer or draw series starts;
+        // doing nothing keeps the backend from receiving it again.
+        if state
+            .binder
+            .holds(index as usize, bind_group, &state.temp_offsets)
+        {
+            return Ok(());
+        }
+
         if merge_bind_groups {
             // Merge the bind group's resources into the tracker. We only do this
             // for render passes. For compute passes it is done per dispatch in
@@ -142,8 +151,8 @@ where
 /// See the compute pass version of `State::flush_bindings` for an explanation
 /// of some differences in handling the two types of passes.
 pub(super) fn flush_bindings_helper(state: &mut PassState) -> Result<(), DestroyedResourceError> {
-    let start = state.binder.take_rebind_start_index();
-    let entries = state.binder.list_valid_with_start(start);
+    let rebind = state.binder.take_rebind_mask();
+    let entries = state.binder.list_valid_in(rebind);
     let pipeline_layout = state.binder.pipeline_layout.as_ref().unwrap();
 
     for (i, bind_group, dynamic_offsets) in entries {

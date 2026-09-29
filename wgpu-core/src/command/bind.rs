@@ -189,29 +189,44 @@ mod compat {
         }
     }
 
+    /// Set of bind group indices, one bit per index.
+    pub(in crate::command) type RebindMask = u32;
+
+    const _: () = assert!(hal::MAX_BIND_GROUPS <= RebindMask::BITS as usize);
+
+    /// Every index a pass can bind.
+    pub(in crate::command) const ALL_GROUPS: RebindMask =
+        RebindMask::MAX >> (RebindMask::BITS as usize - hal::MAX_BIND_GROUPS);
+
     #[derive(Debug)]
     pub(super) struct BoundBindGroupLayouts {
         entries: [Entry; hal::MAX_BIND_GROUPS],
-        rebind_start: usize,
+        /// Groups to send to the backend before the next draw or dispatch.
+        ///
+        /// Assigning a group dirties only its own index: backends bind every group
+        /// against the current pipeline layout, so rebinding group `i` with an
+        /// unchanged layout does not disturb the groups above it. What does disturb
+        /// them, a pipeline layout incompatible from index `i` on, is tracked by
+        /// [`Self::update_expectations`], which dirties the whole tail from `i`.
+        rebind: RebindMask,
     }
 
     impl BoundBindGroupLayouts {
         pub fn new() -> Self {
             Self {
                 entries: [const { Entry::empty() }; hal::MAX_BIND_GROUPS],
-                rebind_start: 0,
+                rebind: ALL_GROUPS,
             }
         }
 
-        /// Takes the start index of the bind group range to be rebound, and clears it.
-        pub fn take_rebind_start_index(&mut self) -> usize {
-            let start = self.rebind_start;
-            self.rebind_start = self.entries.len();
-            start
+        /// Takes the set of bind groups to be rebound, and clears it.
+        pub fn take_rebind_mask(&mut self) -> RebindMask {
+            core::mem::take(&mut self.rebind)
         }
 
-        pub fn update_rebind_start_index(&mut self, start_index: usize) {
-            self.rebind_start = self.rebind_start.min(start_index);
+        /// Dirties every group from `start_index` on.
+        pub fn rebind_from(&mut self, start_index: usize) {
+            self.rebind |= ALL_GROUPS >> start_index << start_index;
         }
 
         pub fn update_expectations(&mut self, expectations: &[Option<Arc<BindGroupLayout>>]) {
@@ -241,13 +256,13 @@ mod compat {
             }
 
             if let Some(rebind_start_index) = rebind_start_index {
-                self.update_rebind_start_index(rebind_start_index);
+                self.rebind_from(rebind_start_index);
             }
         }
 
         pub fn assign(&mut self, index: usize, value: Arc<BindGroupLayout>) {
             self.entries[index].assigned = Some(value);
-            self.update_rebind_start_index(index);
+            self.rebind |= 1 << index;
         }
 
         pub fn clear(&mut self, index: usize) {
@@ -375,7 +390,7 @@ impl Binder {
         if let Some(old) = old {
             // root constants are the base compatibility property
             if old.immediate_size != new.immediate_size {
-                self.manager.update_rebind_start_index(0);
+                self.manager.rebind_from(0);
             }
         }
 
@@ -423,24 +438,40 @@ impl Binder {
         self.manager.assign(index, bind_group.layout.clone());
     }
 
+    /// Group `index` already holds `group` with these dynamic offsets: assigning it
+    /// again would change nothing but mark the group for a redundant rebind.
+    pub(super) fn holds(
+        &self,
+        index: usize,
+        group: &Arc<BindGroup>,
+        offsets: &[wgt::DynamicOffset],
+    ) -> bool {
+        let payload = &self.payloads[index];
+        payload
+            .group
+            .as_ref()
+            .is_some_and(|bound| Arc::ptr_eq(bound, group))
+            && payload.dynamic_offsets == offsets
+    }
+
     pub(super) fn clear_group(&mut self, index: usize) {
         self.payloads[index].reset();
         self.manager.clear(index);
     }
 
-    /// Takes the start index of the bind group range to be rebound, and clears it.
-    pub(super) fn take_rebind_start_index(&mut self) -> usize {
-        self.manager.take_rebind_start_index()
+    /// Takes the set of bind groups to be rebound, and clears it.
+    pub(super) fn take_rebind_mask(&mut self) -> compat::RebindMask {
+        self.manager.take_rebind_mask()
     }
 
-    pub(super) fn list_valid_with_start(
+    pub(super) fn list_valid_in(
         &self,
-        start: usize,
+        mask: compat::RebindMask,
     ) -> impl Iterator<Item = (usize, &Arc<BindGroup>, &[wgt::DynamicOffset])> + '_ {
         let payloads = &self.payloads;
         self.manager
             .list_valid()
-            .filter(move |i| *i >= start)
+            .filter(move |i| mask & (1 << i) != 0)
             .map(move |index| {
                 (
                     index,
@@ -464,7 +495,7 @@ impl Binder {
     pub(super) fn list_valid(
         &self,
     ) -> impl Iterator<Item = (usize, &Arc<BindGroup>, &[wgt::DynamicOffset])> + '_ {
-        self.list_valid_with_start(0)
+        self.list_valid_in(compat::ALL_GROUPS)
     }
 
     pub(super) fn check_compatibility<T: Labeled>(

@@ -13,7 +13,282 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         BIND_GROUP_NONFILTERING_LAYOUT_MAG_SAMPLER,
         BIND_GROUP_NONFILTERING_LAYOUT_MIPMAP_SAMPLER,
         BIND_GROUP_WITH_MAX_BINDING_INDEX,
+        REBINDING_A_GROUP_KEEPS_THE_GROUPS_ABOVE_IT,
+        THE_BOUND_GROUP_SET_AGAIN_TAKES_ITS_NEW_OFFSETS,
     ]);
+}
+
+/// Setting the bound pipeline or the bound group again is skipped, but only when
+/// nothing changes: the same group with new dynamic offsets must still reach the
+/// backend.
+#[gpu_test]
+static THE_BOUND_GROUP_SET_AGAIN_TAKES_ITS_NEW_OFFSETS: GpuTestConfiguration =
+    GpuTestConfiguration::new()
+        .parameters(
+            TestParameters::default()
+                .downlevel_flags(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+                .limits(wgpu::Limits::downlevel_defaults()),
+        )
+        .run_async(the_bound_group_set_again_takes_its_new_offsets);
+
+async fn the_bound_group_set_again_takes_its_new_offsets(ctx: TestingContext) {
+    const SHADER: &str = "
+        @group(0) @binding(0) var<uniform> input: vec2<u32>;
+        @group(1) @binding(0) var<storage, read_write> output: array<u32, 4>;
+
+        @compute @workgroup_size(1) fn main() {
+            output[input.x] = input.y;
+        }
+    ";
+    let stride = u64::from(ctx.device.limits().min_uniform_buffer_offset_alignment);
+    let entry = |ty, has_dynamic_offset| wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty,
+            has_dynamic_offset,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let input_layout = ctx
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[entry(wgpu::BufferBindingType::Uniform, true)],
+        });
+    let output_layout = ctx
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[entry(
+                wgpu::BufferBindingType::Storage { read_only: false },
+                false,
+            )],
+        });
+    let layout = ctx
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&input_layout), Some(&output_layout)],
+            immediate_size: 0,
+        });
+    let module = ctx
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
+    let pipeline = ctx
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+    let mut contents = vec![0u32; (stride * 2 / 4) as usize];
+    contents[..2].copy_from_slice(&[0, 11]);
+    contents[(stride / 4) as usize..(stride / 4) as usize + 2].copy_from_slice(&[1, 22]);
+    let inputs = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&contents),
+            usage: BufferUsages::UNIFORM,
+        });
+    let input_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &input_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &inputs,
+                offset: 0,
+                size: NonZeroU64::new(8),
+            }),
+        }],
+    });
+    let output = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 16,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let output_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &output_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: output.as_entire_binding(),
+        }],
+    });
+    let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 16,
+        usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(1, &output_group, &[]);
+        pass.set_bind_group(0, &input_group, &[0]);
+        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(1, &output_group, &[]);
+        pass.set_bind_group(0, &input_group, &[stride as u32]);
+        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_bind_group(0, &input_group, &[stride as u32]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, 16);
+    ctx.queue.submit(Some(encoder.finish()));
+    readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    ctx.async_poll(PollType::wait_indefinitely()).await.unwrap();
+    let written: [u32; 4] = *bytemuck::from_bytes(&readback.slice(..).get_mapped_range().unwrap());
+    assert_eq!(written, [11, 22, 0, 0]);
+}
+
+/// The binder re-sends only the groups a pass dirtied: setting group 0 again must not
+/// unbind group 1, and a pipeline layout that stops being compatible at group 0 must
+/// still rebind group 1 on its own, since backends such as Vulkan disturb every set
+/// above the first incompatible one.
+#[gpu_test]
+static REBINDING_A_GROUP_KEEPS_THE_GROUPS_ABOVE_IT: GpuTestConfiguration =
+    GpuTestConfiguration::new()
+        .parameters(
+            TestParameters::default()
+                .downlevel_flags(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+                .limits(wgpu::Limits::downlevel_defaults()),
+        )
+        .run_async(rebinding_a_group_keeps_the_groups_above_it);
+
+async fn rebinding_a_group_keeps_the_groups_above_it(ctx: TestingContext) {
+    const SHADER: &str = "
+        @group(0) @binding(0) var<storage, read> input: array<u32, 2>;
+        @group(1) @binding(0) var<storage, read_write> output: array<u32, 4>;
+
+        @compute @workgroup_size(1) fn main() {
+            output[input[0]] = input[1];
+        }
+    ";
+    let storage = |binding, read_only, visibility| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let input_layout = |visibility| {
+        ctx.device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[storage(0, true, visibility)],
+            })
+    };
+    let input_a = input_layout(wgpu::ShaderStages::COMPUTE);
+    // Same shape, other visibility: not compatible at group 0.
+    let input_b = input_layout(wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT);
+    let output_layout = ctx
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[storage(0, false, wgpu::ShaderStages::COMPUTE)],
+        });
+    let module = ctx
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
+    let pipeline = |input: &wgpu::BindGroupLayout| {
+        let layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(input), Some(&output_layout)],
+                immediate_size: 0,
+            });
+        ctx.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+    };
+    let (pipeline_a, pipeline_b) = (pipeline(&input_a), pipeline(&input_b));
+    let input = |layout: &wgpu::BindGroupLayout, slot: u32, value: u32| {
+        let buffer = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[slot, value]),
+                usage: BufferUsages::STORAGE,
+            });
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        })
+    };
+    let output = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 16,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let output_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &output_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: output.as_entire_binding(),
+        }],
+    });
+    let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 16,
+        usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        pass.set_pipeline(&pipeline_a);
+        pass.set_bind_group(1, &output_group, &[]);
+        pass.set_bind_group(0, &input(&input_a, 0, 11), &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_bind_group(0, &input(&input_a, 1, 22), &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_pipeline(&pipeline_b);
+        pass.set_bind_group(0, &input(&input_b, 2, 33), &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, 16);
+    ctx.queue.submit(Some(encoder.finish()));
+    readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    ctx.async_poll(PollType::wait_indefinitely()).await.unwrap();
+    let written: [u32; 4] = *bytemuck::from_bytes(&readback.slice(..).get_mapped_range().unwrap());
+    assert_eq!(written, [11, 22, 33, 0]);
 }
 
 /// Create two bind groups against the same bind group layout, in the same

@@ -2774,6 +2774,16 @@ fn set_pipeline(
 ) -> Result<(), RenderPassErrorInner> {
     api_log!("RenderPass::set_pipeline {}", pipeline.error_ident());
 
+    // The bound pipeline set again changes no state: every check and backend call
+    // below already ran for it in this pass.
+    if state
+        .pipeline
+        .as_ref()
+        .is_some_and(|bound| Arc::ptr_eq(bound, &pipeline))
+    {
+        return Ok(());
+    }
+
     state.pipeline = Some(pipeline.clone());
 
     let pipeline = state

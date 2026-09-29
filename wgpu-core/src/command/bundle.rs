@@ -1729,8 +1729,8 @@ impl State {
     ///
     /// This should be further deduplicated with similar code on render/compute passes.
     fn flush_bindings(&mut self) {
-        let start = self.binder.take_rebind_start_index();
-        let entries = self.binder.list_valid_with_start(start);
+        let rebind = self.binder.take_rebind_mask();
+        let entries = self.binder.list_valid_in(rebind);
 
         self.commands
             .extend(entries.map(|(i, bind_group, dynamic_offsets)| {
