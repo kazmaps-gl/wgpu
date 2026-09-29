@@ -17,6 +17,7 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         AN_INDEX_BUFFER_THAT_TAKES_A_DESTROYED_ONES_PLACE_DRAWS_ITS_OWN_INDICES,
         ONE_VERTEX_STATE_DRAWS_WITH_THE_INDEX_BUFFER_OF_EACH_DRAW,
         MORE_VERTEX_STATES_THAN_THE_CACHE_HOLDS_DRAW_THEIR_OWN_DATA,
+        A_CACHED_VERTEX_ARRAY_SURVIVES_ASYNC_PIPELINE_COMPLETION,
     ]);
 }
 
@@ -450,5 +451,94 @@ async fn more_vertex_states_than_the_cache_holds_draw_their_own_data(ctx: Testin
     assert!(
         first.is_empty() && second.is_empty(),
         "draws with wrong colors: {first:?} on first sight, {second:?} drawn again"
+    );
+}
+
+#[gpu_test]
+static A_CACHED_VERTEX_ARRAY_SURVIVES_ASYNC_PIPELINE_COMPLETION: GpuTestConfiguration =
+    GpuTestConfiguration::new()
+        .parameters(TestParameters::default())
+        .run_async(a_cached_vertex_array_survives_async_pipeline_completion);
+
+async fn a_cached_vertex_array_survives_async_pipeline_completion(ctx: TestingContext) {
+    let canvas = Canvas::new(&ctx);
+    let vertices = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: None,
+        contents: bytemuck::cast_slice(&cover([255, 0, 0, 255])),
+        usage: BufferUsages::VERTEX,
+    });
+    let indices = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: None,
+        contents: bytemuck::cast_slice(&[0u32, 1, 2]),
+        usage: BufferUsages::INDEX,
+    });
+    let draw = |pipeline: &wgpu::RenderPipeline, pixel, load| {
+        canvas.submit(&ctx, load, |pass| {
+            pass.set_pipeline(pipeline);
+            pass.set_vertex_buffer(0, vertices.slice(..));
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            at_pixel(pass, pixel);
+            pass.draw_indexed(0..3, 0, 0..1);
+        });
+    };
+    draw(&canvas.interleaved, 0, CLEAR);
+    draw(&canvas.interleaved, 1, LOAD);
+
+    let inverted = ctx
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(
+                SHADER
+                    .replace(
+                        "return input.color;",
+                        "return vec4f(vec3f(1.0) - input.color.rgb, input.color.a);",
+                    )
+                    .into(),
+            ),
+        });
+    let ready = ctx
+        .device
+        .create_render_pipeline_async(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &inverted,
+                entry_point: Some("interleaved"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &vertex_attr_array![0 => Float32x2, 1 => Unorm8x4],
+                })],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &inverted,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+        .await
+        .unwrap();
+    draw(&canvas.interleaved, 2, LOAD);
+    draw(&ready, 3, LOAD);
+    draw(&canvas.interleaved, 4, LOAD);
+
+    let pixels = canvas.pixels(&ctx).await;
+    assert_eq!(
+        pixels[..5],
+        [
+            [255, 0, 0, 255],
+            [255, 0, 0, 255],
+            [255, 0, 0, 255],
+            [0, 255, 255, 255],
+            [255, 0, 0, 255],
+        ]
     );
 }

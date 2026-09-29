@@ -1358,13 +1358,34 @@ impl Global {
     ) {
         profiling::scope!("Device::create_render_pipeline");
 
-        let hub = &self.hub;
-
-        let fid = hub.render_pipelines.prepare(id_in);
-
         let device = self.hub.devices.get(device_id);
 
-        self.device_create_general_render_pipeline(desc.clone().into(), device, fid)
+        poll_ready(self.device_create_general_render_pipeline(
+            desc.clone().into(),
+            device,
+            id_in,
+            false,
+        ))
+    }
+
+    #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+    pub fn device_create_render_pipeline_async(
+        self: &Arc<Self>,
+        device_id: DeviceId,
+        desc: pipeline::RenderPipelineDescriptor<'static>,
+    ) -> impl core::future::Future<
+        Output = (
+            id::RenderPipelineId,
+            Option<pipeline::CreateRenderPipelineError>,
+        ),
+    > + 'static {
+        let device = self.hub.devices.get(device_id);
+        let global = self.clone();
+        async move {
+            global
+                .device_create_general_render_pipeline(desc.into(), device, None, true)
+                .await
+        }
     }
 
     pub fn device_create_mesh_pipeline(
@@ -1376,19 +1397,21 @@ impl Global {
         id::RenderPipelineId,
         Option<pipeline::CreateRenderPipelineError>,
     ) {
-        let hub = &self.hub;
-
-        let fid = hub.render_pipelines.prepare(id_in);
-
         let device = self.hub.devices.get(device_id);
-        self.device_create_general_render_pipeline(desc.clone().into(), device, fid)
+        poll_ready(self.device_create_general_render_pipeline(
+            desc.clone().into(),
+            device,
+            id_in,
+            false,
+        ))
     }
 
-    fn device_create_general_render_pipeline(
+    async fn device_create_general_render_pipeline(
         &self,
-        desc: pipeline::GeneralRenderPipelineDescriptor,
+        desc: pipeline::GeneralRenderPipelineDescriptor<'_>,
         device: Arc<crate::device::resource::Device>,
-        fid: crate::registry::FutureId<Arc<pipeline::RenderPipeline>>,
+        id_in: Option<id::RenderPipelineId>,
+        asynchronous: bool,
     ) -> (
         id::RenderPipelineId,
         Option<pipeline::CreateRenderPipelineError>,
@@ -1553,18 +1576,21 @@ impl Global {
                 cache,
             };
 
-            let (pipeline, error) = device.create_render_pipeline(desc);
+            let (pipeline, error) = device.create_render_pipeline(desc, asynchronous).await;
 
-            let id = fid.assign(pipeline);
+            let id = hub.render_pipelines.prepare(id_in).assign(pipeline);
             api_log!("Device::create_render_pipeline -> {id:?}");
 
             return (id, error);
         };
 
-        let id = fid.assign(pipeline::RenderPipeline::invalid(
-            device.clone(),
-            desc.label.to_string(),
-        ));
+        let id = hub
+            .render_pipelines
+            .prepare(id_in)
+            .assign(pipeline::RenderPipeline::invalid(
+                device.clone(),
+                desc.label.to_string(),
+            ));
 
         (id, Some(error))
     }
@@ -2054,5 +2080,14 @@ impl Global {
 
         buffer.device.check_is_valid()?;
         buffer.unmap()
+    }
+}
+
+fn poll_ready<T>(future: impl core::future::Future<Output = T>) -> T {
+    let mut future = core::pin::pin!(future);
+    let mut context = core::task::Context::from_waker(core::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        core::task::Poll::Ready(value) => value,
+        core::task::Poll::Pending => unreachable!("synchronous pipeline creation yielded"),
     }
 }
