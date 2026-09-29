@@ -267,7 +267,11 @@ impl Device {
     /// of the returned future instead of going to the current error scope or the
     /// uncaptured error handler.
     ///
-    /// Every other backend has no asynchronous form of pipeline creation: it behaves
+    /// On WebGL, `KHR_parallel_shader_compile` is used when available: linking is
+    /// polled without blocking, and failures are returned by the future. Without the
+    /// extension, WebGL falls back to synchronous compilation when the future is polled.
+    ///
+    /// Every native backend has no asynchronous form of pipeline creation: it behaves
     /// exactly like [`Device::create_render_pipeline`], the returned future is already
     /// resolved and always `Ok`, and errors arrive through [`Device::push_error_scope`]
     /// or [`Device::on_uncaptured_error`] as usual.

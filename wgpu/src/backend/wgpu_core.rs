@@ -1338,74 +1338,11 @@ impl dispatch::DeviceInterface for CoreDevice {
         &self,
         desc: &crate::RenderPipelineDescriptor<'_>,
     ) -> dispatch::DispatchRenderPipeline {
-        use wgc::pipeline as pipe;
-
-        let vertex_buffers: ArrayVec<_, { wgc::MAX_VERTEX_BUFFERS }> = desc
-            .vertex
-            .buffers
-            .iter()
-            .map(|vbuf| {
-                vbuf.as_ref().map(|vbuf| pipe::VertexBufferLayout {
-                    array_stride: vbuf.array_stride,
-                    step_mode: vbuf.step_mode,
-                    attributes: Borrowed(vbuf.attributes),
-                })
-            })
-            .collect();
-
-        let vert_constants = desc
-            .vertex
-            .compilation_options
-            .constants
-            .iter()
-            .map(|&(key, value)| (String::from(key), value))
-            .collect();
-
-        let descriptor = pipe::RenderPipelineDescriptor {
-            label: desc.label.map(Borrowed),
-            layout: desc.layout.map(|layout| layout.inner.as_core().id),
-            vertex: pipe::VertexState {
-                stage: pipe::ProgrammableStageDescriptor {
-                    module: desc.vertex.module.inner.as_core().id,
-                    entry_point: desc.vertex.entry_point.map(Borrowed),
-                    constants: vert_constants,
-                    zero_initialize_workgroup_memory: desc
-                        .vertex
-                        .compilation_options
-                        .zero_initialize_workgroup_memory,
-                },
-                buffers: Borrowed(&vertex_buffers),
-            },
-            primitive: desc.primitive,
-            depth_stencil: desc.depth_stencil.clone(),
-            multisample: desc.multisample,
-            fragment: desc.fragment.as_ref().map(|frag| {
-                let frag_constants = frag
-                    .compilation_options
-                    .constants
-                    .iter()
-                    .map(|&(key, value)| (String::from(key), value))
-                    .collect();
-                pipe::FragmentState {
-                    stage: pipe::ProgrammableStageDescriptor {
-                        module: frag.module.inner.as_core().id,
-                        entry_point: frag.entry_point.map(Borrowed),
-                        constants: frag_constants,
-                        zero_initialize_workgroup_memory: frag
-                            .compilation_options
-                            .zero_initialize_workgroup_memory,
-                    },
-                    targets: Borrowed(frag.targets),
-                }
-            }),
-            multiview_mask: desc.multiview_mask,
-            cache: desc.cache.map(|cache| cache.inner.as_core().id),
-        };
-
-        let (id, error) = self
-            .context
-            .0
-            .device_create_render_pipeline(self.id, &descriptor, None);
+        let (id, error) = with_render_pipeline_descriptor(desc, |descriptor| {
+            self.context
+                .0
+                .device_create_render_pipeline(self.id, &descriptor, None)
+        });
         if let Some(cause) = error {
             if let wgc::pipeline::CreateRenderPipelineError::Internal { stage, ref error } = cause {
                 log::error!("Shader translation error for stage {stage:?}: {error}");
@@ -1424,6 +1361,51 @@ impl dispatch::DeviceInterface for CoreDevice {
             error_sink: Arc::clone(&self.error_sink),
         }
         .into()
+    }
+
+    #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+    fn create_render_pipeline_async(
+        &self,
+        desc: &crate::RenderPipelineDescriptor<'_>,
+    ) -> Pin<Box<dyn dispatch::CreateRenderPipelineFuture>> {
+        let descriptor = with_render_pipeline_descriptor(desc, own_render_pipeline_descriptor);
+        let resources = (
+            desc.vertex.module.clone(),
+            desc.fragment.as_ref().map(|stage| stage.module.clone()),
+            desc.layout.cloned(),
+            desc.cache.cloned(),
+        );
+        let context = self.context.clone();
+        let error_sink = self.error_sink.clone();
+        let pending = context
+            .0
+            .device_create_render_pipeline_async(self.id, descriptor);
+        Box::pin(CorePipelineFuture(async move {
+            let (id, error) = pending.await;
+            drop(resources);
+            let pipeline = CoreRenderPipeline {
+                context: context.clone(),
+                id,
+                error_sink,
+            };
+            if let Some(cause) = error {
+                let error_type = cause.webgpu_error_type();
+                let description = context.format_error(&cause);
+                let source: ErrorSource = Box::new(cause);
+                return Err(match error_type {
+                    ErrorType::Validation => crate::Error::Validation {
+                        source,
+                        description,
+                    },
+                    ErrorType::OutOfMemory => crate::Error::OutOfMemory { source },
+                    ErrorType::Internal | ErrorType::DeviceLost => crate::Error::Internal {
+                        source,
+                        description,
+                    },
+                });
+            }
+            Ok(pipeline.into())
+        }))
     }
 
     fn create_mesh_pipeline(
@@ -4115,3 +4097,143 @@ impl dispatch::BufferMappedRangeInterface for CoreBufferMappedRange {
         panic!("Only available on WebGPU")
     }
 }
+
+fn with_render_pipeline_descriptor<T>(
+    desc: &crate::RenderPipelineDescriptor<'_>,
+    create: impl FnOnce(wgc::pipeline::RenderPipelineDescriptor<'_>) -> T,
+) -> T {
+    use wgc::pipeline as pipe;
+
+    let vertex_buffers: ArrayVec<_, { wgc::MAX_VERTEX_BUFFERS }> = desc
+        .vertex
+        .buffers
+        .iter()
+        .map(|vbuf| {
+            vbuf.as_ref().map(|vbuf| pipe::VertexBufferLayout {
+                array_stride: vbuf.array_stride,
+                step_mode: vbuf.step_mode,
+                attributes: Borrowed(vbuf.attributes),
+            })
+        })
+        .collect();
+
+    let vert_constants = desc
+        .vertex
+        .compilation_options
+        .constants
+        .iter()
+        .map(|&(key, value)| (String::from(key), value))
+        .collect();
+
+    let descriptor = pipe::RenderPipelineDescriptor {
+        label: desc.label.map(Borrowed),
+        layout: desc.layout.map(|layout| layout.inner.as_core().id),
+        vertex: pipe::VertexState {
+            stage: pipe::ProgrammableStageDescriptor {
+                module: desc.vertex.module.inner.as_core().id,
+                entry_point: desc.vertex.entry_point.map(Borrowed),
+                constants: vert_constants,
+                zero_initialize_workgroup_memory: desc
+                    .vertex
+                    .compilation_options
+                    .zero_initialize_workgroup_memory,
+            },
+            buffers: Borrowed(&vertex_buffers),
+        },
+        primitive: desc.primitive,
+        depth_stencil: desc.depth_stencil.clone(),
+        multisample: desc.multisample,
+        fragment: desc.fragment.as_ref().map(|frag| {
+            let frag_constants = frag
+                .compilation_options
+                .constants
+                .iter()
+                .map(|&(key, value)| (String::from(key), value))
+                .collect();
+            pipe::FragmentState {
+                stage: pipe::ProgrammableStageDescriptor {
+                    module: frag.module.inner.as_core().id,
+                    entry_point: frag.entry_point.map(Borrowed),
+                    constants: frag_constants,
+                    zero_initialize_workgroup_memory: frag
+                        .compilation_options
+                        .zero_initialize_workgroup_memory,
+                },
+                targets: Borrowed(frag.targets),
+            }
+        }),
+        multiview_mask: desc.multiview_mask,
+        cache: desc.cache.map(|cache| cache.inner.as_core().id),
+    };
+
+    create(descriptor)
+}
+
+#[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+fn own_render_pipeline_descriptor(
+    desc: wgc::pipeline::RenderPipelineDescriptor<'_>,
+) -> wgc::pipeline::RenderPipelineDescriptor<'static> {
+    use wgc::pipeline as pipe;
+    pipe::RenderPipelineDescriptor {
+        label: desc.label.map(|label| Cow::Owned(label.into_owned())),
+        layout: desc.layout,
+        vertex: pipe::VertexState {
+            stage: own_pipeline_stage(desc.vertex.stage),
+            buffers: Cow::Owned(
+                desc.vertex
+                    .buffers
+                    .into_owned()
+                    .into_iter()
+                    .map(|buffer| {
+                        buffer.map(|buffer| pipe::VertexBufferLayout {
+                            array_stride: buffer.array_stride,
+                            step_mode: buffer.step_mode,
+                            attributes: Cow::Owned(buffer.attributes.into_owned()),
+                        })
+                    })
+                    .collect(),
+            ),
+        },
+        primitive: desc.primitive,
+        depth_stencil: desc.depth_stencil,
+        multisample: desc.multisample,
+        fragment: desc.fragment.map(|fragment| pipe::FragmentState {
+            stage: own_pipeline_stage(fragment.stage),
+            targets: Cow::Owned(fragment.targets.into_owned()),
+        }),
+        multiview_mask: desc.multiview_mask,
+        cache: desc.cache,
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+fn own_pipeline_stage(
+    stage: wgc::pipeline::ProgrammableStageDescriptor<'_>,
+) -> wgc::pipeline::ProgrammableStageDescriptor<'static> {
+    wgc::pipeline::ProgrammableStageDescriptor {
+        module: stage.module,
+        entry_point: stage.entry_point.map(|name| Cow::Owned(name.into_owned())),
+        constants: stage.constants,
+        zero_initialize_workgroup_memory: stage.zero_initialize_workgroup_memory,
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+struct CorePipelineFuture<F>(F);
+
+#[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+impl<F: core::future::Future> core::future::Future for CorePipelineFuture<F> {
+    type Output = F::Output;
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        unsafe { self.map_unchecked_mut(|this| &mut this.0) }.poll(cx)
+    }
+}
+
+// SAFETY: wgpu/build.rs defines wasm send_sync only for the explicit
+// fragile-send-sync-non-atomic-wasm opt-in with target_feature != "atomics".
+// This implementation is therefore absent from every WASM threads build.
+#[cfg(all(target_arch = "wasm32", not(target_os = "emscripten"), send_sync))]
+unsafe impl<F> Send for CorePipelineFuture<F> {}

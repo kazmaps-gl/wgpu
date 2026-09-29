@@ -42,6 +42,15 @@ Bottom level categories:
 
 ## Unreleased
 
+### Performance
+
+#### GLES / OpenGL
+
+- On WebGL, `create_render_pipeline_async` waits for `KHR_parallel_shader_compile`
+  completion before checking link status and reflecting uniforms, avoiding shader
+  compiler waits on the calling thread. Cancellation releases unfinished programs
+  and shaders; browsers without the extension retain synchronous compilation.
+
 ## v30.0.1 (2026-08-21)
 
 ### Bug Fixes

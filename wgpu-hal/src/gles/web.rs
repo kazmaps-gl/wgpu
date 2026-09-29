@@ -12,9 +12,24 @@ use super::TextureFormatDesc;
 pub struct AdapterContext {
     pub glow_context: glow::Context,
     pub webgl2_context: web_sys::WebGl2RenderingContext,
+    pub(super) parallel_shader_compile: bool,
 }
 
 impl AdapterContext {
+    fn new(webgl2_context: web_sys::WebGl2RenderingContext) -> Self {
+        let parallel_shader_compile = webgl2_context
+            .get_extension("KHR_parallel_shader_compile")
+            .ok()
+            .flatten()
+            .is_some();
+        let glow_context = glow::Context::from_webgl2_context(webgl2_context.clone());
+        Self {
+            glow_context,
+            webgl2_context,
+            parallel_shader_compile,
+        }
+    }
+
     pub fn is_owned(&self) -> bool {
         false
     }
@@ -125,14 +140,9 @@ impl crate::Instance for Instance {
         surface_hint: Option<&Surface>,
     ) -> Vec<crate::ExposedAdapter<super::Api>> {
         if let Some(surface_hint) = surface_hint {
-            let gl = glow::Context::from_webgl2_context(surface_hint.webgl2_context.clone());
-
             unsafe {
                 super::Adapter::expose(
-                    AdapterContext {
-                        glow_context: gl,
-                        webgl2_context: surface_hint.webgl2_context.clone(),
-                    },
+                    AdapterContext::new(surface_hint.webgl2_context.clone()),
                     self.options.clone(),
                 )
             }
@@ -192,16 +202,7 @@ impl super::Adapter {
         webgl2_context: web_sys::WebGl2RenderingContext,
         options: wgt::GlBackendOptions,
     ) -> Option<crate::ExposedAdapter<super::Api>> {
-        let glow_context = glow::Context::from_webgl2_context(webgl2_context.clone());
-        unsafe {
-            Self::expose(
-                AdapterContext {
-                    glow_context,
-                    webgl2_context,
-                },
-                options,
-            )
-        }
+        unsafe { Self::expose(AdapterContext::new(webgl2_context), options) }
     }
 
     pub fn adapter_context(&self) -> &AdapterContext {
@@ -487,4 +488,16 @@ impl crate::Surface for Surface {
     }
 
     unsafe fn discard_texture(&self, _texture: super::Texture) {}
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen(
+    inline_js = "export function wgpuShaderPollDelay() { return new Promise(resolve => setTimeout(resolve, 8)); }"
+)]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = wgpuShaderPollDelay)]
+    fn shader_poll_delay() -> js_sys::Promise;
+}
+
+pub(super) async fn wait_for_shader_poll() {
+    let _ = wasm_bindgen_futures::JsFuture::from(shader_poll_delay()).await;
 }
