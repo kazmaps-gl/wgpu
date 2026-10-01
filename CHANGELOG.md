@@ -42,6 +42,15 @@ Bottom level categories:
 
 ## Unreleased
 
+### New Features
+
+#### General
+
+- Added `Device::create_compute_pipeline_async`. On WebGPU it calls
+  `GPUDevice.createComputePipelineAsync()`, so the browser does not compile the shader
+  on the GPU process' main thread; every other backend creates the pipeline
+  synchronously and returns a resolved future.
+
 ### Performance
 
 #### GLES / OpenGL

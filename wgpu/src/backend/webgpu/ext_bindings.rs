@@ -46,7 +46,8 @@ impl NavigatorGpu for web_sys::WorkerNavigator {
 
 // --- Bindings for `GPUPipelineError` ---
 
-/// The rejection value of `GPUDevice.createRenderPipelineAsync()`.
+/// The rejection value of `GPUDevice.createRenderPipelineAsync()` and
+/// `GPUDevice.createComputePipelineAsync()`.
 ///
 /// Not part of the `webgpu_sys` bindings vendored from `web-sys`, hence the hand-written
 /// binding here. It extends `js_sys::Object` rather than `web_sys::DomException`, which it
