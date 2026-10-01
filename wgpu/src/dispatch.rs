@@ -55,6 +55,7 @@ trait_alias!(PopErrorScopeFuture: Future<Output = Option<crate::Error>> + WasmNo
 trait_alias!(ShaderCompilationInfoFuture: Future<Output = crate::CompilationInfo> + WasmNotSend + 'static);
 trait_alias!(EnumerateAdapterFuture: Future<Output = Vec<DispatchAdapter>> + WasmNotSend + 'static);
 trait_alias!(CreateRenderPipelineFuture: Future<Output = Result<DispatchRenderPipeline, crate::Error>> + WasmNotSend + 'static);
+trait_alias!(CreateComputePipelineFuture: Future<Output = Result<DispatchComputePipeline, crate::Error>> + WasmNotSend + 'static);
 
 // We can't use trait aliases here, as you can't convert from a dyn Trait to dyn Supertrait _yet_.
 #[cfg(send_sync)]
@@ -192,6 +193,20 @@ pub trait DeviceInterface: CommonTraits {
         &self,
         desc: &crate::ComputePipelineDescriptor<'_>,
     ) -> DispatchComputePipeline;
+
+    /// Create a compute pipeline, letting the backend compile it off the calling thread.
+    ///
+    /// WebGPU overrides this to await pipeline compilation. Everywhere else this default
+    /// creates the pipeline synchronously and hands back a ready future: the result is
+    /// always `Ok`, and failures are reported through the error scopes and the
+    /// uncaptured error handler, exactly as for [`Self::create_compute_pipeline`].
+    fn create_compute_pipeline_async(
+        &self,
+        desc: &crate::ComputePipelineDescriptor<'_>,
+    ) -> Pin<Box<dyn CreateComputePipelineFuture>> {
+        let pipeline = self.create_compute_pipeline(desc);
+        Box::pin(core::future::ready(Ok(pipeline)))
+    }
     unsafe fn create_pipeline_cache(
         &self,
         desc: &crate::PipelineCacheDescriptor<'_>,

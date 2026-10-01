@@ -86,7 +86,8 @@ impl crate::Error {
         }
     }
 
-    /// Map a rejection of `createRenderPipelineAsync` to an [`Error`].
+    /// Map a rejection of `createRenderPipelineAsync` or `createComputePipelineAsync` to an
+    /// [`Error`].
     ///
     /// The specification rejects with a `GPUPipelineError`, whose `reason` tells a
     /// validation failure from an internal one. A rejection with anything else (a browser
@@ -623,6 +624,33 @@ fn map_vertex_step_mode(mode: wgt::VertexStepMode) -> webgpu_sys::GpuVertexStepM
         VertexStepMode::Vertex => sm::Vertex,
         VertexStepMode::Instance => sm::Instance,
     }
+}
+
+fn map_compute_pipeline_descriptor(
+    desc: &crate::ComputePipelineDescriptor<'_>,
+) -> webgpu_sys::GpuComputePipelineDescriptor {
+    let shader_module = desc.module.inner.as_webgpu();
+    let mapped_compute_stage = webgpu_sys::GpuProgrammableStage::new(&shader_module.module);
+    insert_constants_map(&mapped_compute_stage, desc.compilation_options.constants);
+    if let Some(ep) = desc.entry_point {
+        mapped_compute_stage.set_entry_point(ep);
+    }
+    let mapped_desc = match desc.layout {
+        Some(layout) => webgpu_sys::GpuComputePipelineDescriptor::new(
+            &layout.inner.as_webgpu().inner,
+            &mapped_compute_stage,
+        ),
+        None => webgpu_sys::GpuComputePipelineDescriptor::new_with_gpu_auto_layout_mode(
+            webgpu_sys::GpuAutoLayoutMode::Auto,
+            &mapped_compute_stage,
+        ),
+    };
+
+    if let Some(label) = desc.label {
+        mapped_desc.set_label(label);
+    }
+
+    mapped_desc
 }
 
 fn map_render_pipeline_descriptor(
@@ -1191,6 +1219,20 @@ fn future_request_device(
             // wasm-bindgen provides a reasonable error stringification via `Debug` impl
             inner: crate::RequestDeviceErrorKind::WebGpu(format!("{error_value:?}")),
         })
+}
+
+fn future_create_compute_pipeline(
+    result: Result<webgpu_sys::GpuComputePipeline, wasm_bindgen::JsValue>,
+) -> Result<dispatch::DispatchComputePipeline, crate::Error> {
+    result
+        .map(|compute_pipeline| {
+            WebComputePipeline {
+                inner: compute_pipeline,
+                ident: crate::cmp::Identifier::create(),
+            }
+            .into()
+        })
+        .map_err(crate::Error::from_pipeline_error)
 }
 
 fn future_create_render_pipeline(
@@ -2473,26 +2515,7 @@ impl dispatch::DeviceInterface for WebDevice {
         &self,
         desc: &crate::ComputePipelineDescriptor<'_>,
     ) -> dispatch::DispatchComputePipeline {
-        let shader_module = desc.module.inner.as_webgpu();
-        let mapped_compute_stage = webgpu_sys::GpuProgrammableStage::new(&shader_module.module);
-        insert_constants_map(&mapped_compute_stage, desc.compilation_options.constants);
-        if let Some(ep) = desc.entry_point {
-            mapped_compute_stage.set_entry_point(ep);
-        }
-        let mapped_desc = match desc.layout {
-            Some(layout) => webgpu_sys::GpuComputePipelineDescriptor::new(
-                &layout.inner.as_webgpu().inner,
-                &mapped_compute_stage,
-            ),
-            None => webgpu_sys::GpuComputePipelineDescriptor::new_with_gpu_auto_layout_mode(
-                webgpu_sys::GpuAutoLayoutMode::Auto,
-                &mapped_compute_stage,
-            ),
-        };
-
-        if let Some(label) = desc.label {
-            mapped_desc.set_label(label);
-        }
+        let mapped_desc = map_compute_pipeline_descriptor(desc);
 
         let compute_pipeline = self.inner.create_compute_pipeline(&mapped_desc);
 
@@ -2501,6 +2524,20 @@ impl dispatch::DeviceInterface for WebDevice {
             ident: crate::cmp::Identifier::create(),
         }
         .into()
+    }
+
+    fn create_compute_pipeline_async(
+        &self,
+        desc: &crate::ComputePipelineDescriptor<'_>,
+    ) -> Pin<Box<dyn dispatch::CreateComputePipelineFuture>> {
+        let mapped_desc = map_compute_pipeline_descriptor(desc);
+
+        let pipeline_promise = self.inner.create_compute_pipeline_async(&mapped_desc);
+
+        Box::pin(MakeSendFuture::new(
+            wasm_bindgen_futures::JsFuture::from(pipeline_promise),
+            future_create_compute_pipeline,
+        ))
     }
 
     unsafe fn create_pipeline_cache(
