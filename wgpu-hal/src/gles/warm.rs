@@ -55,7 +55,19 @@ impl Warm {
         pipeline: &super::RenderPipeline,
         main_vertex_array: glow::VertexArray,
     ) {
-        let Some((zeroes, size)) = (unsafe { self.zeroes(gl, shared) }) else {
+        // Three vertices or one instance past each attribute; WebGL2 reports no stride limit.
+        let vertices = pipeline
+            .vertex_attributes
+            .iter()
+            .filter_map(|attribute| {
+                let buffer = pipeline
+                    .vertex_buffers
+                    .get(attribute.buffer_index as usize)?;
+                Some(u64::from(attribute.offset) + 2 * u64::from(buffer.as_ref()?.stride) + 16)
+            })
+            .max()
+            .unwrap_or(0);
+        let Some((zeroes, size)) = (unsafe { self.zeroes(gl, shared, vertices) }) else {
             return;
         };
         let key = TargetKey {
@@ -127,17 +139,23 @@ impl Warm {
         &mut self,
         gl: &glow::Context,
         shared: &super::AdapterShared,
+        vertices: u64,
     ) -> Option<(glow::Buffer, i32)> {
-        if self.zeroes.is_none() {
-            let uniforms = shared.limits.max_uniform_buffer_binding_size;
-            // Three vertices or one instance past the farthest attribute offset.
-            let vertices = 3 * u64::from(shared.limits.max_vertex_buffer_array_stride) + 4096;
-            let size = i32::try_from(uniforms.max(vertices)).unwrap_or(i32::MAX);
-            let buffer = unsafe { gl.create_buffer() }.ok()?;
-            unsafe { gl.bind_buffer(glow::ARRAY_BUFFER, Some(buffer)) };
-            unsafe { gl.buffer_data_size(glow::ARRAY_BUFFER, size, glow::STATIC_DRAW) };
-            unsafe { gl.bind_buffer(glow::ARRAY_BUFFER, None) };
-            self.zeroes = Some((buffer, size));
+        let wanted = shared.limits.max_uniform_buffer_binding_size.max(vertices);
+        let wanted = i32::try_from(wanted).ok()?;
+        match self.zeroes {
+            Some((_, size)) if size >= wanted => {}
+            stale => {
+                if let Some((buffer, _)) = stale {
+                    unsafe { gl.delete_buffer(buffer) };
+                }
+                self.zeroes = None;
+                let buffer = unsafe { gl.create_buffer() }.ok()?;
+                unsafe { gl.bind_buffer(glow::ARRAY_BUFFER, Some(buffer)) };
+                unsafe { gl.buffer_data_size(glow::ARRAY_BUFFER, wanted, glow::STATIC_DRAW) };
+                unsafe { gl.bind_buffer(glow::ARRAY_BUFFER, None) };
+                self.zeroes = Some((buffer, wanted));
+            }
         }
         self.zeroes
     }
