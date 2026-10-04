@@ -96,6 +96,8 @@ mod device;
 mod fence;
 mod queue;
 mod vertex_array;
+#[cfg(webgl)]
+mod warm;
 
 pub use fence::Fence;
 
@@ -342,6 +344,8 @@ pub struct Adapter {
 pub struct Device {
     shared: Arc<AdapterShared>,
     vertex_arrays: Arc<Mutex<vertex_array::VertexArrays>>,
+    #[cfg(webgl)]
+    warm: Mutex<warm::Warm>,
     #[cfg(all(native, feature = "renderdoc"))]
     render_doc: crate::auxil::renderdoc::RenderDoc,
     counters: Arc<wgt::HalCounters>,
@@ -351,6 +355,10 @@ impl Drop for Device {
     fn drop(&mut self) {
         let gl = &self.shared.context.lock();
         unsafe { self.vertex_arrays.lock().delete(gl) };
+        #[cfg(webgl)]
+        unsafe {
+            self.warm.lock().delete(gl)
+        };
     }
 }
 

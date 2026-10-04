@@ -1126,6 +1126,8 @@ impl crate::Adapter for super::Adapter {
             device: super::Device {
                 shared: Arc::clone(&self.shared),
                 vertex_arrays: Arc::clone(&vertex_arrays),
+                #[cfg(webgl)]
+                warm: Mutex::new(Default::default()),
                 #[cfg(all(native, feature = "renderdoc"))]
                 render_doc: Default::default(),
                 counters: Default::default(),

@@ -46,7 +46,7 @@ pub(super) struct AttributePointer {
 
 impl AttributePointer {
     /// Points `location` here; the buffer must be bound to `ARRAY_BUFFER`.
-    unsafe fn specify(&self, gl: &glow::Context, location: u32) {
+    pub(super) unsafe fn specify(&self, gl: &glow::Context, location: u32) {
         let (size, data_type) = (self.format.element_count, self.format.element_format);
         let (stride, offset) = (self.stride as i32, self.offset as i32);
         match self.format.attrib_kind {
@@ -255,6 +255,12 @@ impl VertexArrays {
 
     pub(super) fn set_index_buffer(&mut self, buffer: glow::Buffer) {
         self.index_buffer = Some(buffer);
+    }
+
+    /// The object bound outside render passes.
+    #[cfg(webgl)]
+    pub(super) const fn main(&self) -> glow::VertexArray {
+        self.main
     }
 
     /// Ends a render pass: binds the main object back for the code outside passes.
