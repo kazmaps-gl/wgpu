@@ -1463,82 +1463,8 @@ impl super::Queue {
             }
             C::SetColorTarget {
                 draw_buffer_index,
-                desc: super::ColorTargetDesc { mask, ref blend },
-            } => {
-                use wgt::ColorWrites as Cw;
-                if let Some(index) = draw_buffer_index {
-                    unsafe {
-                        gl.color_mask_draw_buffer(
-                            index,
-                            mask.contains(Cw::RED),
-                            mask.contains(Cw::GREEN),
-                            mask.contains(Cw::BLUE),
-                            mask.contains(Cw::ALPHA),
-                        )
-                    };
-                    if let Some(ref blend) = *blend {
-                        unsafe { gl.enable_draw_buffer(glow::BLEND, index) };
-                        if blend.color != blend.alpha {
-                            unsafe {
-                                gl.blend_equation_separate_draw_buffer(
-                                    index,
-                                    blend.color.equation,
-                                    blend.alpha.equation,
-                                )
-                            };
-                            unsafe {
-                                gl.blend_func_separate_draw_buffer(
-                                    index,
-                                    blend.color.src,
-                                    blend.color.dst,
-                                    blend.alpha.src,
-                                    blend.alpha.dst,
-                                )
-                            };
-                        } else {
-                            unsafe { gl.blend_equation_draw_buffer(index, blend.color.equation) };
-                            unsafe {
-                                gl.blend_func_draw_buffer(index, blend.color.src, blend.color.dst)
-                            };
-                        }
-                    } else {
-                        unsafe { gl.disable_draw_buffer(glow::BLEND, index) };
-                    }
-                } else {
-                    unsafe {
-                        gl.color_mask(
-                            mask.contains(Cw::RED),
-                            mask.contains(Cw::GREEN),
-                            mask.contains(Cw::BLUE),
-                            mask.contains(Cw::ALPHA),
-                        )
-                    };
-                    if let Some(ref blend) = *blend {
-                        unsafe { gl.enable(glow::BLEND) };
-                        if blend.color != blend.alpha {
-                            unsafe {
-                                gl.blend_equation_separate(
-                                    blend.color.equation,
-                                    blend.alpha.equation,
-                                )
-                            };
-                            unsafe {
-                                gl.blend_func_separate(
-                                    blend.color.src,
-                                    blend.color.dst,
-                                    blend.alpha.src,
-                                    blend.alpha.dst,
-                                )
-                            };
-                        } else {
-                            unsafe { gl.blend_equation(blend.color.equation) };
-                            unsafe { gl.blend_func(blend.color.src, blend.color.dst) };
-                        }
-                    } else {
-                        unsafe { gl.disable(glow::BLEND) };
-                    }
-                }
-            }
+                ref desc,
+            } => unsafe { set_color_target(gl, draw_buffer_index, desc) },
             C::BindBuffer {
                 target,
                 slot,
@@ -1972,3 +1898,79 @@ impl crate::Queue for super::Queue {
 unsafe impl Sync for super::Queue {}
 #[cfg(send_sync)]
 unsafe impl Send for super::Queue {}
+
+/// Color write mask and blend of one target, or of all targets when `draw_buffer_index` is
+/// `None`; shared with the pipeline warm-up so its draw keys the same pipeline state.
+pub(super) unsafe fn set_color_target(
+    gl: &glow::Context,
+    draw_buffer_index: Option<u32>,
+    desc: &super::ColorTargetDesc,
+) {
+    let super::ColorTargetDesc { mask, ref blend } = *desc;
+    use wgt::ColorWrites as Cw;
+    if let Some(index) = draw_buffer_index {
+        unsafe {
+            gl.color_mask_draw_buffer(
+                index,
+                mask.contains(Cw::RED),
+                mask.contains(Cw::GREEN),
+                mask.contains(Cw::BLUE),
+                mask.contains(Cw::ALPHA),
+            )
+        };
+        if let Some(ref blend) = *blend {
+            unsafe { gl.enable_draw_buffer(glow::BLEND, index) };
+            if blend.color != blend.alpha {
+                unsafe {
+                    gl.blend_equation_separate_draw_buffer(
+                        index,
+                        blend.color.equation,
+                        blend.alpha.equation,
+                    )
+                };
+                unsafe {
+                    gl.blend_func_separate_draw_buffer(
+                        index,
+                        blend.color.src,
+                        blend.color.dst,
+                        blend.alpha.src,
+                        blend.alpha.dst,
+                    )
+                };
+            } else {
+                unsafe { gl.blend_equation_draw_buffer(index, blend.color.equation) };
+                unsafe { gl.blend_func_draw_buffer(index, blend.color.src, blend.color.dst) };
+            }
+        } else {
+            unsafe { gl.disable_draw_buffer(glow::BLEND, index) };
+        }
+    } else {
+        unsafe {
+            gl.color_mask(
+                mask.contains(Cw::RED),
+                mask.contains(Cw::GREEN),
+                mask.contains(Cw::BLUE),
+                mask.contains(Cw::ALPHA),
+            )
+        };
+        if let Some(ref blend) = *blend {
+            unsafe { gl.enable(glow::BLEND) };
+            if blend.color != blend.alpha {
+                unsafe { gl.blend_equation_separate(blend.color.equation, blend.alpha.equation) };
+                unsafe {
+                    gl.blend_func_separate(
+                        blend.color.src,
+                        blend.color.dst,
+                        blend.alpha.src,
+                        blend.alpha.dst,
+                    )
+                };
+            } else {
+                unsafe { gl.blend_equation(blend.color.equation) };
+                unsafe { gl.blend_func(blend.color.src, blend.color.dst) };
+            }
+        } else {
+            unsafe { gl.disable(glow::BLEND) };
+        }
+    }
+}

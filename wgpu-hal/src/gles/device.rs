@@ -1811,7 +1811,14 @@ impl crate::Device for super::Device {
                     result?
                 }
             };
-            self.assemble_render_pipeline(desc, vertex_buffers, inner)
+            let pipeline = self.assemble_render_pipeline(desc, vertex_buffers, inner)?;
+            let main_vertex_array = self.vertex_arrays.lock().main();
+            unsafe {
+                self.warm
+                    .lock()
+                    .draw(gl, &self.shared, desc, &pipeline, main_vertex_array)
+            };
+            Ok(pipeline)
         })
     }
 
