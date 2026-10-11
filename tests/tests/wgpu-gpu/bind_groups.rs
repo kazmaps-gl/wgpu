@@ -14,6 +14,7 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         BIND_GROUP_NONFILTERING_LAYOUT_MIPMAP_SAMPLER,
         BIND_GROUP_WITH_MAX_BINDING_INDEX,
         REBINDING_A_GROUP_KEEPS_THE_GROUPS_ABOVE_IT,
+        A_LAYOUT_THAT_LEAVES_A_GROUP_EMPTY_REBINDS_THE_GROUPS_ABOVE_IT,
         THE_BOUND_GROUP_SET_AGAIN_TAKES_ITS_NEW_OFFSETS,
     ]);
 }
@@ -289,6 +290,150 @@ async fn rebinding_a_group_keeps_the_groups_above_it(ctx: TestingContext) {
     ctx.async_poll(PollType::wait_indefinitely()).await.unwrap();
     let written: [u32; 4] = *bytemuck::from_bytes(&readback.slice(..).get_mapped_range().unwrap());
     assert_eq!(written, [11, 22, 33, 0]);
+}
+
+/// A pipeline layout with an empty slot where the previous layout had a group is
+/// incompatible from that slot on: the backend set layout there changes (Vulkan binds an
+/// empty set layout, Metal no longer counts the group's slots), so the group above the
+/// gap must be sent again under the new layout even though it did not change.
+#[gpu_test]
+static A_LAYOUT_THAT_LEAVES_A_GROUP_EMPTY_REBINDS_THE_GROUPS_ABOVE_IT: GpuTestConfiguration =
+    GpuTestConfiguration::new()
+        .parameters(
+            TestParameters::default()
+                .downlevel_flags(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+                .limits(wgpu::Limits::downlevel_defaults()),
+        )
+        .run_async(a_layout_that_leaves_a_group_empty_rebinds_the_groups_above_it);
+
+async fn a_layout_that_leaves_a_group_empty_rebinds_the_groups_above_it(ctx: TestingContext) {
+    const WITH_MIDDLE: &str = "
+        @group(0) @binding(0) var<storage, read> input: array<u32, 2>;
+        @group(1) @binding(0) var<storage, read_write> middle: array<u32, 4>;
+        @group(2) @binding(0) var<storage, read_write> output: array<u32, 4>;
+
+        @compute @workgroup_size(1) fn main() {
+            middle[0] = 7u;
+            output[input[0]] = input[1];
+        }
+    ";
+    const WITHOUT_MIDDLE: &str = "
+        @group(0) @binding(0) var<storage, read> input: array<u32, 2>;
+        @group(2) @binding(0) var<storage, read_write> output: array<u32, 4>;
+
+        @compute @workgroup_size(1) fn main() {
+            output[input[0]] = input[1];
+        }
+    ";
+    let storage = |read_only| wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let layout = |read_only| {
+        ctx.device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[storage(read_only)],
+            })
+    };
+    let (input_layout, write_layout) = (layout(true), layout(false));
+    let pipeline = |source: &str, middle: Option<&wgpu::BindGroupLayout>| {
+        let module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&input_layout), middle, Some(&write_layout)],
+                immediate_size: 0,
+            });
+        ctx.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+    };
+    let with_middle = pipeline(WITH_MIDDLE, Some(&write_layout));
+    let without_middle = pipeline(WITHOUT_MIDDLE, None);
+    let input = |slot: u32, value: u32| {
+        let buffer = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&[slot, value]),
+                usage: BufferUsages::STORAGE,
+            });
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &input_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        })
+    };
+    let written = |buffer: &wgpu::Buffer| {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &write_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        })
+    };
+    let target = || {
+        ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
+    };
+    let (middle, output) = (target(), target());
+    let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 32,
+        usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        pass.set_pipeline(&with_middle);
+        pass.set_bind_group(0, &input(0, 11), &[]);
+        pass.set_bind_group(1, &written(&middle), &[]);
+        pass.set_bind_group(2, &written(&output), &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_pipeline(&without_middle);
+        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_bind_group(0, &input(1, 22), &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&middle, 0, &readback, 0, 16);
+    encoder.copy_buffer_to_buffer(&output, 0, &readback, 16, 16);
+    ctx.queue.submit(Some(encoder.finish()));
+    readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    ctx.async_poll(PollType::wait_indefinitely()).await.unwrap();
+    let written: [u32; 8] = *bytemuck::from_bytes(&readback.slice(..).get_mapped_range().unwrap());
+    assert_eq!(written, [7, 0, 0, 0, 11, 22, 0, 0]);
 }
 
 /// Create two bind groups against the same bind group layout, in the same

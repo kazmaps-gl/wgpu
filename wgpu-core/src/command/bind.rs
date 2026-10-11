@@ -206,8 +206,9 @@ mod compat {
         /// Assigning a group dirties only its own index: backends bind every group
         /// against the current pipeline layout, so rebinding group `i` with an
         /// unchanged layout does not disturb the groups above it. What does disturb
-        /// them, a pipeline layout incompatible from index `i` on, is tracked by
-        /// [`Self::update_expectations`], which dirties the whole tail from `i`.
+        /// them, a pipeline layout incompatible from index `i` on (including one that
+        /// leaves index `i` empty), is tracked by [`Self::update_expectations`], which
+        /// dirties the whole tail from `i`.
         rebind: RebindMask,
     }
 
@@ -241,7 +242,10 @@ mod compat {
                 let (must_set, must_rebind) = match (&mut e.expected, new_expected_bgl) {
                     (None, None) => (false, false),
                     (None, Some(_)) => (true, true),
-                    (Some(_), None) => (true, false),
+                    // A gap is still a set to the backend: Vulkan fills it with an empty
+                    // set layout and Metal shifts the slots of the groups above it, so a
+                    // group bound above the gap under the old layout is stale.
+                    (Some(_), None) => (true, true),
                     (Some(old_expected_bgl), Some(new_expected_bgl)) => {
                         let is_different = !old_expected_bgl.is_equal(new_expected_bgl);
                         (is_different, is_different)
