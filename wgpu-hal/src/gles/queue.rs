@@ -1180,6 +1180,9 @@ impl super::Queue {
                         1,
                     )
                 };
+                // The blit obeys the scissor test: a pass that ended under `set_scissor_rect`
+                // would otherwise resolve only that rectangle. The next pass enables it again.
+                unsafe { gl.disable(glow::SCISSOR_TEST) };
                 unsafe {
                     gl.blit_framebuffer(
                         0,
