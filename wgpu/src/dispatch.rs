@@ -172,7 +172,7 @@ pub trait DeviceInterface: CommonTraits {
 
     /// Create a render pipeline, letting the backend compile it off the calling thread.
     ///
-    /// Only the WebGPU backend has an asynchronous form of pipeline creation. Everywhere
+    /// WebGPU and WebGL override this to await pipeline compilation. Everywhere
     /// else this default creates the pipeline synchronously and hands back a ready future:
     /// the result is always `Ok`, and failures are reported through the error scopes and
     /// the uncaptured error handler, exactly as for [`Self::create_render_pipeline`].
