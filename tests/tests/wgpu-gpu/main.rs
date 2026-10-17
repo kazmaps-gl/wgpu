@@ -83,6 +83,8 @@ mod transition_resources;
 mod vertex_formats;
 mod vertex_indices;
 mod vertex_state;
+#[cfg(wasm_test)]
+mod webgl_async_pipeline;
 mod write_texture;
 mod zero_init;
 
@@ -128,6 +130,8 @@ fn all_tests() -> Vec<wgpu_test::GpuTestInitializer> {
     per_vertex::all_tests(&mut tests);
     pipeline_cache::all_tests(&mut tests);
     pipeline::all_tests(&mut tests);
+    #[cfg(wasm_test)]
+    webgl_async_pipeline::all_tests(&mut tests);
     planar_texture::all_tests(&mut tests);
     poll::all_tests(&mut tests);
     primitive_index::all_tests(&mut tests);

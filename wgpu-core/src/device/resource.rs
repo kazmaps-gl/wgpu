@@ -4181,14 +4181,18 @@ impl Device {
         Ok(pipeline)
     }
 
-    pub fn create_render_pipeline(
+    pub async fn create_render_pipeline(
         self: &Arc<Self>,
-        desc: pipeline::ResolvedGeneralRenderPipelineDescriptor,
+        desc: pipeline::ResolvedGeneralRenderPipelineDescriptor<'_>,
+        asynchronous: bool,
     ) -> (
         Arc<pipeline::RenderPipeline>,
         Option<pipeline::CreateRenderPipelineError>,
     ) {
-        let (render_pipeline, error) = match self.create_render_pipeline_inner(desc.clone()) {
+        let (render_pipeline, error) = match self
+            .create_render_pipeline_inner(desc.clone(), asynchronous)
+            .await
+        {
             Ok(pipeline) => (pipeline, None),
             Err(e) => (
                 pipeline::RenderPipeline::invalid(self.clone(), desc.label.to_string()),
@@ -4206,9 +4210,10 @@ impl Device {
         (render_pipeline, error)
     }
 
-    pub fn create_render_pipeline_inner(
+    async fn create_render_pipeline_inner(
         self: &Arc<Self>,
-        desc: pipeline::ResolvedGeneralRenderPipelineDescriptor,
+        desc: pipeline::ResolvedGeneralRenderPipelineDescriptor<'_>,
+        _asynchronous: bool,
     ) -> Result<Arc<pipeline::RenderPipeline>, pipeline::CreateRenderPipelineError> {
         use wgt::TextureFormatFeatureFlags as Tfff;
 
@@ -4985,26 +4990,37 @@ impl Device {
                 multiview_mask: desc.multiview_mask,
                 cache: cache.as_ref().map(|it| it.raw()),
             };
-            unsafe { self.raw().create_render_pipeline(&pipeline_desc) }.map_err(
-                |err| match err {
-                    hal::PipelineError::Device(error) => {
-                        pipeline::CreateRenderPipelineError::Device(self.handle_hal_error(error))
+            #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+            let raw = if _asynchronous {
+                unsafe { self.raw().create_render_pipeline_async(&pipeline_desc) }.await
+            } else {
+                unsafe { self.raw().create_render_pipeline(&pipeline_desc) }
+            };
+            #[cfg(not(all(target_arch = "wasm32", not(target_os = "emscripten"))))]
+            let raw = unsafe { self.raw().create_render_pipeline(&pipeline_desc) };
+            raw.map_err(|err| match err {
+                hal::PipelineError::Device(error) => {
+                    pipeline::CreateRenderPipelineError::Device(self.handle_hal_error(error))
+                }
+                hal::PipelineError::Linkage(stage, msg) => {
+                    pipeline::CreateRenderPipelineError::Internal { stage, error: msg }
+                }
+                hal::PipelineError::EntryPoint(stage) => {
+                    pipeline::CreateRenderPipelineError::Internal {
+                        stage: hal::auxil::map_naga_stage(stage),
+                        error: ENTRYPOINT_FAILURE_ERROR.to_string(),
                     }
-                    hal::PipelineError::Linkage(stage, msg) => {
-                        pipeline::CreateRenderPipelineError::Internal { stage, error: msg }
-                    }
-                    hal::PipelineError::EntryPoint(stage) => {
-                        pipeline::CreateRenderPipelineError::Internal {
-                            stage: hal::auxil::map_naga_stage(stage),
-                            error: ENTRYPOINT_FAILURE_ERROR.to_string(),
-                        }
-                    }
-                    hal::PipelineError::PipelineConstants(stage, error) => {
-                        pipeline::CreateRenderPipelineError::PipelineConstants { stage, error }
-                    }
-                },
-            )?
+                }
+                hal::PipelineError::PipelineConstants(stage, error) => {
+                    pipeline::CreateRenderPipelineError::PipelineConstants { stage, error }
+                }
+            })?
         };
+
+        if let Err(error) = self.check_is_valid() {
+            unsafe { self.raw().destroy_render_pipeline(raw) };
+            return Err(error.into());
+        }
 
         let pass_context = RenderPassContext {
             attachments: AttachmentData {
