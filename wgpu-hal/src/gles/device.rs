@@ -23,6 +23,39 @@ type ShaderStage<'a> = (
 );
 type NameBindingMap = FastHashMap<String, (super::BindingRegister, u8)>;
 
+struct ProgramObjects<'a> {
+    gl: &'a glow::Context,
+    program: Option<glow::Program>,
+    shaders: ArrayVec<glow::Shader, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
+}
+
+impl Drop for ProgramObjects<'_> {
+    fn drop(&mut self) {
+        for shader in self.shaders.drain(..) {
+            unsafe { self.gl.delete_shader(shader) };
+        }
+        if let Some(program) = self.program.take() {
+            unsafe { self.gl.delete_program(program) };
+        }
+    }
+}
+
+struct ProgramCompilation {
+    glsl_version: naga::back::glsl::Version,
+    private_caps: PrivateCapabilities,
+    defer_status: bool,
+}
+
+struct PendingProgram<'a> {
+    objects: ProgramObjects<'a>,
+    name_binding_map: NameBindingMap,
+    immediates_items:
+        ArrayVec<Vec<naga::back::glsl::ImmediateItem>, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
+    sampler_map: super::SamplerBindMap,
+    has_stages: wgt::ShaderStages,
+    clip_distance_count: u32,
+}
+
 struct CompilationContext<'a> {
     layout: &'a super::PipelineLayout,
     sampler_map: &'a mut super::SamplerBindMap,
@@ -30,6 +63,7 @@ struct CompilationContext<'a> {
     immediates_items: &'a mut Vec<naga::back::glsl::ImmediateItem>,
     multiview_mask: Option<NonZeroU32>,
     clip_distance_count: &'a mut u32,
+    defer_status: bool,
 }
 
 impl CompilationContext<'_> {
@@ -247,6 +281,7 @@ impl super::Device {
 
     unsafe fn compile_shader(
         gl: &glow::Context,
+        defer_status: bool,
         shader: &str,
         naga_stage: naga::ShaderStage,
         #[cfg_attr(target_arch = "wasm32", allow(unused))] label: Option<&str>,
@@ -263,7 +298,7 @@ impl super::Device {
             | naga::ShaderStage::Miss => unreachable!(),
         };
 
-        let raw = unsafe { gl.create_shader(target) }.unwrap();
+        let raw = unsafe { gl.create_shader(target) }.map_err(|_| crate::DeviceError::Lost)?;
         #[cfg(native)]
         if gl.supports_debug() {
             let name = raw.0.get();
@@ -274,6 +309,10 @@ impl super::Device {
         unsafe { gl.compile_shader(raw) };
 
         log::debug!("\tCompiled shader {raw:?}");
+
+        if defer_status {
+            return Ok(raw);
+        }
 
         let compiled_ok = unsafe { gl.get_shader_compile_status(raw) };
         let msg = unsafe { gl.get_shader_info_log(raw) };
@@ -299,6 +338,7 @@ impl super::Device {
         context: CompilationContext,
         program: glow::Program,
     ) -> Result<glow::Shader, crate::PipelineError> {
+        let defer_status = context.defer_status;
         let source = 'outer: {
             use naga::back::glsl;
             let pipeline_options = glsl::PipelineOptions {
@@ -395,7 +435,15 @@ impl super::Device {
             Cow::Owned(output)
         };
 
-        unsafe { Self::compile_shader(gl, &source, naga_stage, stage.module.label.as_deref()) }
+        unsafe {
+            Self::compile_shader(
+                gl,
+                defer_status,
+                &source,
+                naga_stage,
+                stage.module.label.as_deref(),
+            )
+        }
     }
 
     unsafe fn create_pipeline<'a>(
@@ -406,21 +454,7 @@ impl super::Device {
         #[cfg_attr(target_arch = "wasm32", allow(unused))] label: Option<&str>,
         multiview_mask: Option<NonZeroU32>,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
-        let mut program_stages = ArrayVec::new();
-        let group_to_binding_to_slot = layout
-            .group_infos
-            .iter()
-            .map(|group| group.as_ref().map(|group| group.binding_to_slot.clone()))
-            .collect::<Vec<_>>();
-        for &(naga_stage, stage) in &shaders {
-            program_stages.push(super::ProgramStage {
-                naga_stage: naga_stage.to_owned(),
-                shader_id: stage.module.id,
-                entry_point: stage.entry_point.to_owned(),
-                zero_initialize_workgroup_memory: stage.zero_initialize_workgroup_memory,
-                constant_hash: Self::create_constant_hash(stage),
-            });
-        }
+        let key = Self::program_cache_key(&shaders, layout);
         let mut guard = self
             .shared
             .program_cache
@@ -429,10 +463,7 @@ impl super::Device {
         // This guard ensures that we can't accidentally destroy a program whilst we're about to reuse it
         // The only place that destroys a pipeline is also locking on `program_cache`
         let program = guard
-            .entry(super::ProgramCacheKey {
-                stages: program_stages,
-                group_to_binding_to_slot: group_to_binding_to_slot.into_boxed_slice(),
-            })
+            .entry(key)
             .or_insert_with(|| unsafe {
                 Self::create_program(
                     gl,
@@ -448,6 +479,31 @@ impl super::Device {
         drop(guard);
 
         Ok(program)
+    }
+
+    fn program_cache_key(
+        shaders: &ArrayVec<ShaderStage<'_>, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
+        layout: &super::PipelineLayout,
+    ) -> super::ProgramCacheKey {
+        let mut program_stages = ArrayVec::new();
+        let group_to_binding_to_slot = layout
+            .group_infos
+            .iter()
+            .map(|group| group.as_ref().map(|group| group.binding_to_slot.clone()))
+            .collect::<Vec<_>>();
+        for &(naga_stage, stage) in shaders {
+            program_stages.push(super::ProgramStage {
+                naga_stage: naga_stage.to_owned(),
+                shader_id: stage.module.id,
+                entry_point: stage.entry_point.to_owned(),
+                zero_initialize_workgroup_memory: stage.zero_initialize_workgroup_memory,
+                constant_hash: Self::create_constant_hash(stage),
+            });
+        }
+        super::ProgramCacheKey {
+            stages: program_stages,
+            group_to_binding_to_slot: group_to_binding_to_slot.into_boxed_slice(),
+        }
     }
 
     fn create_constant_hash(stage: &crate::ProgrammableStage<super::ShaderModule>) -> Vec<u8> {
@@ -470,14 +526,49 @@ impl super::Device {
         glsl_version: naga::back::glsl::Version,
         private_caps: PrivateCapabilities,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
+        let pending = unsafe {
+            Self::begin_program(
+                gl,
+                shaders,
+                layout,
+                label,
+                multiview_mask,
+                ProgramCompilation {
+                    glsl_version,
+                    private_caps,
+                    defer_status: false,
+                },
+            )
+        }?;
+        unsafe { Self::finish_program(pending, private_caps) }
+    }
+
+    unsafe fn begin_program<'a>(
+        gl: &'a glow::Context,
+        shaders: ArrayVec<ShaderStage<'a>, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
+        layout: &super::PipelineLayout,
+        #[cfg_attr(target_arch = "wasm32", allow(unused))] label: Option<&str>,
+        multiview_mask: Option<NonZeroU32>,
+        compilation: ProgramCompilation,
+    ) -> Result<PendingProgram<'a>, crate::PipelineError> {
+        let ProgramCompilation {
+            glsl_version,
+            private_caps: _private_caps,
+            defer_status,
+        } = compilation;
         let glsl_version = match glsl_version {
             naga::back::glsl::Version::Embedded { version, .. } => format!("{version} es"),
             naga::back::glsl::Version::Desktop(version) => format!("{version}"),
         };
-        let program = unsafe { gl.create_program() }.unwrap();
+        let program = unsafe { gl.create_program() }.map_err(|_| crate::DeviceError::Lost)?;
+        let mut objects = ProgramObjects {
+            gl,
+            program: Some(program),
+            shaders: ArrayVec::new(),
+        };
         #[cfg(native)]
         if let Some(label) = label {
-            if private_caps.contains(PrivateCapabilities::DEBUG_FNS) {
+            if _private_caps.contains(PrivateCapabilities::DEBUG_FNS) {
                 let name = program.0.get();
                 unsafe { gl.object_label(glow::PROGRAM, name, Some(label)) };
             }
@@ -487,7 +578,6 @@ impl super::Device {
         let mut immediates_items = ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
         let mut sampler_map = [None; super::MAX_TEXTURE_SLOTS];
         let mut has_stages = wgt::ShaderStages::empty();
-        let mut shaders_to_delete = ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
         let mut clip_distance_count = 0;
 
         for &(naga_stage, stage) in &shaders {
@@ -503,10 +593,11 @@ impl super::Device {
                 immediates_items: pc_item,
                 multiview_mask,
                 clip_distance_count: &mut clip_distance_count,
+                defer_status,
             };
 
             let shader = Self::create_shader(gl, naga_stage, stage, context, program)?;
-            shaders_to_delete.push(shader);
+            objects.shaders.push(shader);
         }
 
         // Create empty fragment shader if only vertex shader is present
@@ -516,25 +607,46 @@ impl super::Device {
             let shader = unsafe {
                 Self::compile_shader(
                     gl,
+                    defer_status,
                     &shader_src,
                     naga::ShaderStage::Fragment,
                     Some("(wgpu internal) dummy fragment shader"),
                 )
             }?;
-            shaders_to_delete.push(shader);
+            objects.shaders.push(shader);
         }
 
-        for &shader in shaders_to_delete.iter() {
+        for &shader in objects.shaders.iter() {
             unsafe { gl.attach_shader(program, shader) };
         }
         unsafe { gl.link_program(program) };
 
-        for shader in shaders_to_delete {
-            unsafe { gl.delete_shader(shader) };
-        }
-
         log::debug!("\tLinked program {program:?}");
 
+        Ok(PendingProgram {
+            objects,
+            name_binding_map,
+            immediates_items,
+            sampler_map,
+            has_stages,
+            clip_distance_count,
+        })
+    }
+
+    unsafe fn finish_program(
+        pending: PendingProgram<'_>,
+        private_caps: PrivateCapabilities,
+    ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
+        let PendingProgram {
+            mut objects,
+            name_binding_map,
+            immediates_items,
+            sampler_map,
+            has_stages,
+            clip_distance_count,
+        } = pending;
+        let gl = objects.gl;
+        let program = objects.program.unwrap();
         let linked_ok = unsafe { gl.get_program_link_status(program) };
         let msg = unsafe { gl.get_program_info_log(program) };
         if !linked_ok {
@@ -552,7 +664,13 @@ impl super::Device {
                 log::trace!("Get binding {name:?} from program {program:?}");
                 match register {
                     super::BindingRegister::UniformBuffers => {
-                        let index = unsafe { gl.get_uniform_block_index(program, name) }.unwrap();
+                        let index = unsafe { gl.get_uniform_block_index(program, name) }
+                            .ok_or_else(|| {
+                                crate::PipelineError::Linkage(
+                                    has_stages,
+                                    format!("Missing uniform block {name}"),
+                                )
+                            })?;
                         log::trace!("\tBinding slot {slot} to block index {index}");
                         unsafe { gl.uniform_block_binding(program, index, slot as _) };
                     }
@@ -602,6 +720,7 @@ impl super::Device {
             None
         };
 
+        objects.program = None;
         Ok(Arc::new(super::PipelineInner {
             program,
             sampler_map,
@@ -609,6 +728,79 @@ impl super::Device {
             immediates_descs: uniforms,
             clip_distance_count,
         }))
+    }
+    fn assemble_render_pipeline(
+        &self,
+        desc: &crate::RenderPipelineDescriptor<
+            super::PipelineLayout,
+            super::ShaderModule,
+            super::PipelineCache,
+        >,
+        vertex_buffers: &[Option<crate::VertexBufferLayout<'_>>],
+        inner: Arc<super::PipelineInner>,
+    ) -> Result<super::RenderPipeline, crate::PipelineError> {
+        let (vertex_buffers, vertex_attributes) = {
+            let mut buffers = Vec::new();
+            let mut attributes = Vec::new();
+            for (index, vb_layout) in vertex_buffers.iter().enumerate() {
+                let vb_desc = if let Some(vb_layout) = vb_layout {
+                    for vat in vb_layout.attributes.iter() {
+                        let format_desc = conv::describe_vertex_format(vat.format);
+                        attributes.push(super::AttributeDesc {
+                            location: vat.shader_location,
+                            offset: vat.offset as u32,
+                            buffer_index: index as u32,
+                            format_desc,
+                        });
+                    }
+                    Some(super::VertexBufferDesc {
+                        step: vb_layout.step_mode,
+                        stride: vb_layout.array_stride as u32,
+                    })
+                } else {
+                    None
+                };
+                buffers.push(vb_desc);
+            }
+            (buffers.into_boxed_slice(), attributes.into_boxed_slice())
+        };
+
+        let color_targets = {
+            let mut targets = Vec::new();
+            for ct in desc.color_targets.iter().filter_map(|at| at.as_ref()) {
+                targets.push(super::ColorTargetDesc {
+                    mask: ct.write_mask,
+                    blend: ct.blend.as_ref().map(conv::map_blend),
+                });
+            }
+            //Note: if any of the states are different, and `INDEPENDENT_BLEND` flag
+            // is not exposed, then this pipeline will not bind correctly.
+            targets.into_boxed_slice()
+        };
+
+        self.counters.render_pipelines.add(1);
+
+        Ok(super::RenderPipeline {
+            inner,
+            primitive: desc.primitive,
+            vertex_buffers,
+            vertex_attributes,
+            color_targets,
+            depth: desc.depth_stencil.as_ref().map(|ds| super::DepthState {
+                function: conv::map_compare_func(ds.depth_compare.unwrap_or_default()),
+                mask: ds.depth_write_enabled.unwrap_or_default(),
+            }),
+            depth_bias: desc
+                .depth_stencil
+                .as_ref()
+                .map(|ds| ds.bias)
+                .unwrap_or_default(),
+            stencil: desc
+                .depth_stencil
+                .as_ref()
+                .map(|ds| conv::map_stencil(&ds.stencil)),
+            alpha_to_coverage_enabled: desc.multisample.alpha_to_coverage_enabled,
+        })
     }
 }
 
@@ -1540,67 +1732,86 @@ impl crate::Device for super::Device {
             self.create_pipeline(gl, shaders, desc.layout, desc.label, desc.multiview_mask)
         }?;
 
-        let (vertex_buffers, vertex_attributes) = {
-            let mut buffers = Vec::new();
-            let mut attributes = Vec::new();
-            for (index, vb_layout) in vertex_buffers.iter().enumerate() {
-                let vb_desc = if let Some(vb_layout) = vb_layout {
-                    for vat in vb_layout.attributes.iter() {
-                        let format_desc = conv::describe_vertex_format(vat.format);
-                        attributes.push(super::AttributeDesc {
-                            location: vat.shader_location,
-                            offset: vat.offset as u32,
-                            buffer_index: index as u32,
-                            format_desc,
-                        });
+        self.assemble_render_pipeline(desc, vertex_buffers, inner)
+    }
+
+    #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+    unsafe fn create_render_pipeline_async<'a>(
+        &'a self,
+        desc: &'a crate::RenderPipelineDescriptor<
+            super::PipelineLayout,
+            super::ShaderModule,
+            super::PipelineCache,
+        >,
+    ) -> crate::RenderPipelineFuture<'a, super::RenderPipeline> {
+        alloc::boxed::Box::pin(async move {
+            let gl = self.shared.context.lock();
+            if self.shared.context.webgl2_context.is_context_lost() {
+                return Err(crate::DeviceError::Lost.into());
+            }
+            if !self.shared.context.parallel_shader_compile {
+                return unsafe { self.create_render_pipeline(desc) };
+            }
+            let (vertex_stage, vertex_buffers) = match &desc.vertex_processor {
+                crate::VertexProcessor::Standard {
+                    vertex_buffers,
+                    vertex_stage,
+                } => (vertex_stage, vertex_buffers),
+                crate::VertexProcessor::Mesh { .. } => unreachable!(),
+            };
+            let mut shaders = ArrayVec::new();
+            shaders.push((naga::ShaderStage::Vertex, vertex_stage));
+            if let Some(ref fs) = desc.fragment_stage {
+                shaders.push((naga::ShaderStage::Fragment, fs));
+            }
+            let key = Self::program_cache_key(&shaders, desc.layout);
+            let cached = self.shared.program_cache.lock().get(&key).cloned();
+            let inner = if let Some(cached) = cached {
+                cached?
+            } else {
+                let pending = unsafe {
+                    Self::begin_program(
+                        gl,
+                        shaders,
+                        desc.layout,
+                        desc.label,
+                        desc.multiview_mask,
+                        ProgramCompilation {
+                            glsl_version: self.shared.shading_language_version,
+                            private_caps: self.shared.private_caps,
+                            defer_status: true,
+                        },
+                    )
+                }?;
+                loop {
+                    if self.shared.context.webgl2_context.is_context_lost() {
+                        return Err(crate::DeviceError::Lost.into());
                     }
-                    Some(super::VertexBufferDesc {
-                        step: vb_layout.step_mode,
-                        stride: vb_layout.array_stride as u32,
-                    })
+                    if unsafe { gl.get_program_completion_status(pending.objects.program.unwrap()) }
+                    {
+                        break;
+                    }
+                    super::web::wait_for_shader_poll().await;
+                }
+                let result = unsafe { Self::finish_program(pending, self.shared.private_caps) };
+                if self.shared.context.webgl2_context.is_context_lost() {
+                    if let Ok(program) = result {
+                        unsafe { gl.delete_program(program.program) };
+                    }
+                    return Err(crate::DeviceError::Lost.into());
+                }
+                let mut cache = self.shared.program_cache.lock();
+                if let Some(existing) = cache.get(&key) {
+                    if let Ok(program) = result {
+                        unsafe { gl.delete_program(program.program) };
+                    }
+                    existing.clone()?
                 } else {
-                    None
-                };
-                buffers.push(vb_desc);
-            }
-            (buffers.into_boxed_slice(), attributes.into_boxed_slice())
-        };
-
-        let color_targets = {
-            let mut targets = Vec::new();
-            for ct in desc.color_targets.iter().filter_map(|at| at.as_ref()) {
-                targets.push(super::ColorTargetDesc {
-                    mask: ct.write_mask,
-                    blend: ct.blend.as_ref().map(conv::map_blend),
-                });
-            }
-            //Note: if any of the states are different, and `INDEPENDENT_BLEND` flag
-            // is not exposed, then this pipeline will not bind correctly.
-            targets.into_boxed_slice()
-        };
-
-        self.counters.render_pipelines.add(1);
-
-        Ok(super::RenderPipeline {
-            inner,
-            primitive: desc.primitive,
-            vertex_buffers,
-            vertex_attributes,
-            color_targets,
-            depth: desc.depth_stencil.as_ref().map(|ds| super::DepthState {
-                function: conv::map_compare_func(ds.depth_compare.unwrap_or_default()),
-                mask: ds.depth_write_enabled.unwrap_or_default(),
-            }),
-            depth_bias: desc
-                .depth_stencil
-                .as_ref()
-                .map(|ds| ds.bias)
-                .unwrap_or_default(),
-            stencil: desc
-                .depth_stencil
-                .as_ref()
-                .map(|ds| conv::map_stencil(&ds.stencil)),
-            alpha_to_coverage_enabled: desc.multisample.alpha_to_coverage_enabled,
+                    cache.insert(key, result.clone());
+                    result?
+                }
+            };
+            self.assemble_render_pipeline(desc, vertex_buffers, inner)
         })
     }
 
