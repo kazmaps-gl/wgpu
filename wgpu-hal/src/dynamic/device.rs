@@ -100,6 +100,15 @@ pub trait DynDevice: DynResource {
             dyn DynPipelineCache,
         >,
     ) -> Result<Box<dyn DynRenderPipeline>, PipelineError>;
+    #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+    unsafe fn create_render_pipeline_async<'a>(
+        &'a self,
+        desc: &'a RenderPipelineDescriptor<
+            dyn DynPipelineLayout,
+            dyn DynShaderModule,
+            dyn DynPipelineCache,
+        >,
+    ) -> crate::RenderPipelineFuture<'a, Box<dyn DynRenderPipeline>>;
     unsafe fn destroy_render_pipeline(&self, pipeline: Box<dyn DynRenderPipeline>);
 
     unsafe fn create_compute_pipeline(
@@ -398,36 +407,28 @@ impl<D: Device + DynResource> DynDevice for D {
             dyn DynPipelineCache,
         >,
     ) -> Result<Box<dyn DynRenderPipeline>, PipelineError> {
-        let desc = RenderPipelineDescriptor {
-            label: desc.label,
-            layout: desc.layout.expect_downcast_ref(),
-            vertex_processor: match &desc.vertex_processor {
-                crate::VertexProcessor::Standard {
-                    vertex_buffers,
-                    vertex_stage,
-                } => crate::VertexProcessor::Standard {
-                    vertex_buffers,
-                    vertex_stage: vertex_stage.clone().expect_downcast(),
-                },
-                crate::VertexProcessor::Mesh {
-                    task_stage: task,
-                    mesh_stage: mesh,
-                } => crate::VertexProcessor::Mesh {
-                    task_stage: task.as_ref().map(|a| a.clone().expect_downcast()),
-                    mesh_stage: mesh.clone().expect_downcast(),
-                },
-            },
-            primitive: desc.primitive,
-            depth_stencil: desc.depth_stencil.clone(),
-            multisample: desc.multisample,
-            fragment_stage: desc.fragment_stage.clone().map(|f| f.expect_downcast()),
-            color_targets: desc.color_targets,
-            multiview_mask: desc.multiview_mask,
-            cache: desc.cache.map(|c| c.expect_downcast_ref()),
-        };
+        let desc = downcast_render_pipeline_descriptor::<D>(desc);
 
         unsafe { D::create_render_pipeline(self, &desc) }
             .map(|b| -> Box<dyn DynRenderPipeline> { Box::new(b) })
+    }
+
+    #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+    unsafe fn create_render_pipeline_async<'a>(
+        &'a self,
+        desc: &'a RenderPipelineDescriptor<
+            dyn DynPipelineLayout,
+            dyn DynShaderModule,
+            dyn DynPipelineCache,
+        >,
+    ) -> crate::RenderPipelineFuture<'a, Box<dyn DynRenderPipeline>> {
+        Box::pin(async move {
+            let desc = downcast_render_pipeline_descriptor::<D>(desc);
+
+            unsafe { D::create_render_pipeline_async(self, &desc) }
+                .await
+                .map(|b| -> Box<dyn DynRenderPipeline> { Box::new(b) })
+        })
     }
 
     unsafe fn destroy_render_pipeline(&self, pipeline: Box<dyn DynRenderPipeline>) {
@@ -618,5 +619,48 @@ impl<D: Device + DynResource> DynDevice for D {
 
     fn check_if_oom(&self) -> Result<(), DeviceError> {
         D::check_if_oom(self)
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn downcast_render_pipeline_descriptor<'a, D: Device>(
+    desc: &RenderPipelineDescriptor<
+        'a,
+        dyn DynPipelineLayout,
+        dyn DynShaderModule,
+        dyn DynPipelineCache,
+    >,
+) -> RenderPipelineDescriptor<
+    'a,
+    <D::A as Api>::PipelineLayout,
+    <D::A as Api>::ShaderModule,
+    <D::A as Api>::PipelineCache,
+> {
+    RenderPipelineDescriptor {
+        label: desc.label,
+        layout: desc.layout.expect_downcast_ref(),
+        vertex_processor: match &desc.vertex_processor {
+            crate::VertexProcessor::Standard {
+                vertex_buffers,
+                vertex_stage,
+            } => crate::VertexProcessor::Standard {
+                vertex_buffers,
+                vertex_stage: vertex_stage.clone().expect_downcast(),
+            },
+            crate::VertexProcessor::Mesh {
+                task_stage: task,
+                mesh_stage: mesh,
+            } => crate::VertexProcessor::Mesh {
+                task_stage: task.as_ref().map(|a| a.clone().expect_downcast()),
+                mesh_stage: mesh.clone().expect_downcast(),
+            },
+        },
+        primitive: desc.primitive,
+        depth_stencil: desc.depth_stencil.clone(),
+        multisample: desc.multisample,
+        fragment_stage: desc.fragment_stage.clone().map(|f| f.expect_downcast()),
+        color_targets: desc.color_targets,
+        multiview_mask: desc.multiview_mask,
+        cache: desc.cache.map(|c| c.expect_downcast_ref()),
     }
 }

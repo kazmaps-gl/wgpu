@@ -123,6 +123,7 @@ gles = [
     "dep:parking_lot",
     "dep:profiling",
     "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
     "dep:wayland-sys",
     "dep:web-sys",
     "dep:windows-result",
@@ -319,6 +320,7 @@ ndk-sys = { workspace = true, optional = true }
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies]
 # Backend: GLES
 wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
 web-sys = { workspace = true, optional = true, features = [
     "default",
     "Window",

@@ -834,6 +834,10 @@ pub trait Adapter: WasmNotSendSync {
     fn get_ordered_texture_usages(&self) -> wgt::TextureUses;
 }
 
+#[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+pub type RenderPipelineFuture<'a, T> =
+    core::pin::Pin<Box<dyn core::future::Future<Output = Result<T, PipelineError>> + 'a>>;
+
 /// A connection to a GPU and a pool of resources to use with it.
 ///
 /// A `wgpu-hal` `Device` represents an open connection to a specific graphics
@@ -1079,6 +1083,18 @@ pub trait Device: WasmNotSendSync {
             <Self::A as Api>::PipelineCache,
         >,
     ) -> Result<<Self::A as Api>::RenderPipeline, PipelineError>;
+    #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+    #[allow(clippy::type_complexity)]
+    unsafe fn create_render_pipeline_async<'a>(
+        &'a self,
+        desc: &'a RenderPipelineDescriptor<
+            <Self::A as Api>::PipelineLayout,
+            <Self::A as Api>::ShaderModule,
+            <Self::A as Api>::PipelineCache,
+        >,
+    ) -> RenderPipelineFuture<'a, <Self::A as Api>::RenderPipeline> {
+        Box::pin(async move { unsafe { self.create_render_pipeline(desc) } })
+    }
     unsafe fn destroy_render_pipeline(&self, pipeline: <Self::A as Api>::RenderPipeline);
 
     #[allow(clippy::type_complexity)]
