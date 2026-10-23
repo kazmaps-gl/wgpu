@@ -2,9 +2,6 @@
 
 <img align="right" width="20%" src="logo.png">
 
-[![Build Status](https://img.shields.io/github/actions/workflow/status/gfx-rs/wgpu/ci.yml?branch=trunk&logo=github&label=CI)](https://github.com/gfx-rs/wgpu/actions)
-[![codecov.io](https://img.shields.io/codecov/c/github/gfx-rs/wgpu?logo=codecov&logoColor=fff&label=codecov&token=84qJTesmeS)](https://codecov.io/gh/gfx-rs/wgpu)
-
 `wgpu` is a cross-platform, safe, pure-Rust graphics API. It runs natively on Vulkan, Metal, D3D12, and OpenGL; and on top of WebGL2 and WebGPU on wasm.
 
 The API is based on the [WebGPU standard][webgpu], but is a fully native Rust library. It serves as the core of the WebGPU integration in Firefox, Servo, and Deno.
@@ -16,8 +13,6 @@ See our examples online at <https://wgpu.rs/examples/>. You can see the Rust sou
 ### Learning `wgpu`
 
 If you are new to `wgpu` and graphics programming, we recommend starting with [Learn Wgpu].
-
-<!-- Note, "Learn Wgpu" is using the capitalization style in their header, NOT our styling -->
 
 Additionally, [WebGPU Fundamentals] is a tutorial for WebGPU which is very similar to our API, minus differences between Rust and Javascript.
 
