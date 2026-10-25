@@ -51,6 +51,14 @@ Bottom level categories:
   on the GPU process' main thread; every other backend creates the pipeline
   synchronously and returns a resolved future.
 
+### Bug Fixes
+
+#### naga
+
+- HLSL output: `@builtin(position).w` in a fragment shader is now 1/w of the clip
+  position, as WGSL specifies and the SPIR-V, MSL and GLSL outputs already give;
+  D3D's `SV_Position.w` is w itself. See [#4963](https://github.com/gfx-rs/wgpu/issues/4963).
+
 ### Performance
 
 #### GLES / OpenGL
