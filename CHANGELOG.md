@@ -51,6 +51,15 @@ Bottom level categories:
   on the GPU process' main thread; every other backend creates the pipeline
   synchronously and returns a resolved future.
 
+### Changes
+
+#### GLES / OpenGL
+
+- With EGL, an explicit `GlBackendOptions::gles_minor_version` (or `WGPU_GLES_MINOR_VERSION`)
+  now creates an OpenGL ES context even when the display also offers desktop OpenGL, such as
+  Mesa on Linux. Before, the minor version was ignored there and a desktop OpenGL context was
+  created.
+
 ### Bug Fixes
 
 #### naga

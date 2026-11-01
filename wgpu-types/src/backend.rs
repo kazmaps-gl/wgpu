@@ -249,6 +249,9 @@ impl BackendOptions {
 #[derive(Clone, Debug, Default)]
 pub struct GlBackendOptions {
     /// Which OpenGL ES 3 minor version to request, if using OpenGL ES.
+    ///
+    /// With EGL, anything other than [`Gles3MinorVersion::Automatic`] creates an OpenGL ES
+    /// context even when the display also offers desktop OpenGL.
     pub gles_minor_version: Gles3MinorVersion,
     /// Behavior of OpenGL fences. Affects how `on_completed_work_done` and `device.poll` behave.
     pub fence_behavior: GlFenceBehavior,
