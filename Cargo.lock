@@ -4881,7 +4881,6 @@ dependencies = [
  "proptest",
  "raw-window-handle",
  "ron",
- "rustc-hash 1.1.0",
  "scopeguard",
  "serde",
  "smallvec",
