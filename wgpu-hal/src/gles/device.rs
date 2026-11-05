@@ -17,6 +17,11 @@ use super::{conv, lock, MaybeMutex, PrivateCapabilities};
 use crate::auxil::map_naga_stage;
 use crate::TlasInstance;
 
+/// A fence can signal well after the link it follows; past this many polls the link status is
+/// queried anyway.
+#[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+const MAX_LINK_FENCE_POLLS: u32 = 40;
+
 type ShaderStage<'a> = (
     naga::ShaderStage,
     &'a crate::ProgrammableStage<'a, super::ShaderModule>,
@@ -1749,7 +1754,8 @@ impl crate::Device for super::Device {
             if self.shared.context.webgl2_context.is_context_lost() {
                 return Err(crate::DeviceError::Lost.into());
             }
-            if !self.shared.context.parallel_shader_compile {
+            let fence_poll = !self.shared.context.parallel_shader_compile;
+            if fence_poll && self.shared.options.link_wait != wgt::GlLinkWait::FencePoll {
                 return unsafe { self.create_render_pipeline(desc) };
             }
             let (vertex_stage, vertex_buffers) = match &desc.vertex_processor {
@@ -1783,15 +1789,39 @@ impl crate::Device for super::Device {
                         },
                     )
                 }?;
-                loop {
+                let fence = if fence_poll {
+                    let fence = unsafe { gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0) }.ok();
+                    unsafe { gl.flush() };
+                    fence
+                } else {
+                    None
+                };
+                let mut polls = 0;
+                let lost = loop {
                     if self.shared.context.webgl2_context.is_context_lost() {
-                        return Err(crate::DeviceError::Lost.into());
+                        break true;
                     }
-                    if unsafe { gl.get_program_completion_status(pending.objects.program.unwrap()) }
-                    {
-                        break;
+                    let linked = match fence {
+                        Some(fence) => {
+                            polls += 1;
+                            polls > MAX_LINK_FENCE_POLLS
+                                || unsafe { gl.get_sync_status(fence) } == glow::SIGNALED
+                        }
+                        None if fence_poll => true,
+                        None => unsafe {
+                            gl.get_program_completion_status(pending.objects.program.unwrap())
+                        },
+                    };
+                    if linked {
+                        break false;
                     }
                     super::web::wait_for_shader_poll().await;
+                };
+                if let Some(fence) = fence {
+                    unsafe { gl.delete_sync(fence) };
+                }
+                if lost {
+                    return Err(crate::DeviceError::Lost.into());
                 }
                 let result = unsafe { Self::finish_program(pending, self.shared.private_caps) };
                 if self.shared.context.webgl2_context.is_context_lost() {

@@ -76,6 +76,11 @@ Bottom level categories:
   completion before checking link status and reflecting uniforms, avoiding shader
   compiler waits on the calling thread. Cancellation releases unfinished programs
   and shaders; browsers without the extension retain synchronous compilation.
+- `GlBackendOptions::link_wait` (`WGPU_GL_LINK_WAIT`): with `GlLinkWait::FencePoll`, a WebGL
+  context without `KHR_parallel_shader_compile` flushes the link and polls a fence placed after
+  it before querying the link status, so a browser that links in another process (Firefox)
+  does not block the calling thread for the whole link. The default `Immediate` keeps
+  synchronous compilation.
 
 ## v30.0.1 (2026-08-21)
 
