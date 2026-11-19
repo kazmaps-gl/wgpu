@@ -5046,6 +5046,7 @@ dependencies = [
  "static_assertions",
  "thiserror 2.0.21",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wayland-sys",
  "web-sys",
  "wgpu-naga-bridge",
