@@ -134,6 +134,8 @@ By @alextechcc in [#8014](https://github.com/gfx-rs/wgpu/pull/8014).
 
 #### General
 
+- Added `Device::create_render_pipeline_async` and `Device::create_compute_pipeline_async`. The WebGPU backend uses the corresponding asynchronous browser methods.
+
 - Support the `wasm64-unknown-unknown` target for the web backend. Building for wasm64 requires a nightly toolchain with `-Z build-std=std,panic_abort`. By @nickbabcock in [#9836](https://github.com/gfx-rs/wgpu/pull/9836).
 - Many types now offer `pub const fn default()` in addition to implementing the `Default` trait, allowing constants to make use of default values. By @kpreid in [#9929](https://github.com/gfx-rs/wgpu/pull/9929).
 - `wgpu-core` now exposes `validate_device_descriptor` and `validate_texture_descriptor` functions that perform the same descriptor validation the corresponding resource creation APIs would, without actually creating a resource. This may be useful in conjunction with hal raw APIs. By @andyleiserson in [#9967](https://github.com/gfx-rs/wgpu/pull/9967) and [#9979](https://github.com/gfx-rs/wgpu/pull/9979).
@@ -383,6 +385,8 @@ By @alextechcc in [#8014](https://github.com/gfx-rs/wgpu/pull/8014).
 
 #### GLES
 
+- With EGL, an explicit `GlBackendOptions::gles_minor_version` now requests an OpenGL ES context even when a desktop OpenGL context is also available.
+
 - Enable `TEXTURE_CUBE_MAP_SEAMLESS` on desktop OpenGL so cube maps sample seamlessly across face edges, matching OpenGL ES 3.0+, WebGL 2, Vulkan, Metal, and Direct3D 12. By @kuntal-devrat in [#10628](https://github.com/gfx-rs/wgpu/pull/10628).
 - Fix black EGL surfaces on some platforms by selecting the default framebuffer's color buffer before presentation. By @valadaptive in [#10268](https://github.com/gfx-rs/wgpu/pull/10268).
 - Avoid duplicate `EGL_SURFACE_TYPE` attributes when selecting an EGL framebuffer configuration, which caused Mesa to return no matching configurations. By @BlueJayLouche and @scroix in [#10048](https://github.com/gfx-rs/wgpu/pull/10048).
@@ -400,6 +404,8 @@ By @alextechcc in [#8014](https://github.com/gfx-rs/wgpu/pull/8014).
 - Pass `RenderPassColorAttachment::depth_slice` to the browser, so a render pass into a 3D texture no longer fails validation with "depthSlice is required for a 3D attachment". By @jheising in [#10693](https://github.com/gfx-rs/wgpu/pull/10693).
 
 ### Performance
+
+- WebGL can use `KHR_parallel_shader_compile` to wait for asynchronous render pipeline linking. On a browser without the extension, `GlBackendOptions::link_wait` can select `GlLinkWait::FencePoll` to poll a fence before checking link status.
 
 - GLES: `Queue::submit` no longer resets GL state for command buffers that record no commands (e.g. the internal transit and pre-pass encoders), removing two full reset sequences (about 20 GL calls) per frame for a typical single-pass WebGL2 renderer. By @chinqan in [#10913](https://github.com/gfx-rs/wgpu/pull/10913).
 - Added explicit `Send` and `Sync` implementations to key `wgpu` types so that the compiler can do less work checking those bounds. If you previously added a `#![recursion_limit = ...]` attribute to your crate due to overflow errors involving `wgpu` types, you may now be able to remove it. By @kpreid in [#10177](https://github.com/gfx-rs/wgpu/pull/10177).

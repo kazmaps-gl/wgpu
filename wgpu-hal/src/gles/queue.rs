@@ -5,7 +5,9 @@ use core::sync::atomic::Ordering;
 use arrayvec::ArrayVec;
 use glow::HasContext;
 
-use super::{conv::is_layered_target, Command as C, PrivateCapabilities};
+use super::{
+    conv::is_layered_target, vertex_array::VertexArrays, Command as C, PrivateCapabilities,
+};
 
 const DEBUG_ID: u32 = 0;
 
@@ -195,6 +197,7 @@ impl super::Queue {
         command: &C,
         #[cfg_attr(target_family = "wasm", allow(unused))] data_bytes: &[u8],
         queries: &[glow::Query],
+        vertex_arrays: &mut VertexArrays,
     ) {
         match *command {
             C::Draw {
@@ -205,6 +208,7 @@ impl super::Queue {
                 first_instance,
                 ref first_instance_location,
             } => {
+                unsafe { vertex_arrays.prepare_draw(gl, false) };
                 let supports_full_instancing = self
                     .shared
                     .private_caps
@@ -248,6 +252,7 @@ impl super::Queue {
                 instance_count,
                 ref first_instance_location,
             } => {
+                unsafe { vertex_arrays.prepare_draw(gl, true) };
                 let supports_full_instancing = self
                     .shared
                     .private_caps
@@ -302,6 +307,7 @@ impl super::Queue {
                 indirect_offset,
                 ref first_instance_location,
             } => {
+                unsafe { vertex_arrays.prepare_draw(gl, false) };
                 unsafe { gl.uniform_1_u32(first_instance_location.as_ref(), 0) };
 
                 unsafe { gl.bind_buffer(glow::DRAW_INDIRECT_BUFFER, Some(indirect_buf)) };
@@ -314,6 +320,7 @@ impl super::Queue {
                 indirect_offset,
                 ref first_instance_location,
             } => {
+                unsafe { vertex_arrays.prepare_draw(gl, true) };
                 unsafe { gl.uniform_1_u32(first_instance_location.as_ref(), 0) };
 
                 unsafe { gl.bind_buffer(glow::DRAW_INDIRECT_BUFFER, Some(indirect_buf)) };
@@ -1204,6 +1211,9 @@ impl super::Queue {
                         1,
                     )
                 };
+                // The blit obeys the scissor test: a pass that ended under `set_scissor_rect`
+                // would otherwise resolve only that rectangle. The next pass enables it again.
+                unsafe { gl.disable(glow::SCISSOR_TEST) };
                 unsafe {
                     gl.blit_framebuffer(
                         0,
@@ -1380,66 +1390,40 @@ impl super::Queue {
                 unsafe { gl.stencil_mask_separate(face, write_mask) };
                 unsafe { gl.stencil_op_separate(face, ops.fail, ops.depth_fail, ops.pass) };
             }
-            C::SetVertexAttribute {
-                buffer,
-                ref buffer_desc,
-                attribute_desc: ref vat,
-            } => {
-                unsafe { gl.bind_buffer(glow::ARRAY_BUFFER, buffer) };
+            C::SetVertexAttribute(ref vat) => {
+                unsafe { gl.bind_buffer(glow::ARRAY_BUFFER, None) };
                 unsafe { gl.enable_vertex_attrib_array(vat.location) };
-
-                if buffer.is_none() {
-                    match vat.format_desc.attrib_kind {
-                        super::VertexAttribKind::Float => unsafe {
-                            gl.vertex_attrib_format_f32(
-                                vat.location,
-                                vat.format_desc.element_count,
-                                vat.format_desc.element_format,
-                                true, // always normalized
-                                vat.offset,
-                            )
-                        },
-                        super::VertexAttribKind::Integer => unsafe {
-                            gl.vertex_attrib_format_i32(
-                                vat.location,
-                                vat.format_desc.element_count,
-                                vat.format_desc.element_format,
-                                vat.offset,
-                            )
-                        },
-                    }
-
-                    //Note: there is apparently a bug on AMD 3500U:
-                    // this call is ignored if the current array is disabled.
-                    unsafe { gl.vertex_attrib_binding(vat.location, vat.buffer_index) };
-                } else {
-                    match vat.format_desc.attrib_kind {
-                        super::VertexAttribKind::Float => unsafe {
-                            gl.vertex_attrib_pointer_f32(
-                                vat.location,
-                                vat.format_desc.element_count,
-                                vat.format_desc.element_format,
-                                true, // always normalized
-                                buffer_desc.stride as i32,
-                                vat.offset as i32,
-                            )
-                        },
-                        super::VertexAttribKind::Integer => unsafe {
-                            gl.vertex_attrib_pointer_i32(
-                                vat.location,
-                                vat.format_desc.element_count,
-                                vat.format_desc.element_format,
-                                buffer_desc.stride as i32,
-                                vat.offset as i32,
-                            )
-                        },
-                    }
-                    unsafe { gl.vertex_attrib_divisor(vat.location, buffer_desc.step as u32) };
+                match vat.format_desc.attrib_kind {
+                    super::VertexAttribKind::Float => unsafe {
+                        gl.vertex_attrib_format_f32(
+                            vat.location,
+                            vat.format_desc.element_count,
+                            vat.format_desc.element_format,
+                            true, // always normalized
+                            vat.offset,
+                        )
+                    },
+                    super::VertexAttribKind::Integer => unsafe {
+                        gl.vertex_attrib_format_i32(
+                            vat.location,
+                            vat.format_desc.element_count,
+                            vat.format_desc.element_format,
+                            vat.offset,
+                        )
+                    },
                 }
+
+                //Note: there is apparently a bug on AMD 3500U:
+                // this call is ignored if the current array is disabled.
+                unsafe { gl.vertex_attrib_binding(vat.location, vat.buffer_index) };
             }
             C::UnsetVertexAttribute(location) => {
                 unsafe { gl.disable_vertex_attrib_array(location) };
             }
+            C::SetVertexArrayAttribute(ref attribute) => vertex_arrays.set_attribute(attribute),
+            C::UnsetVertexArrayAttribute(location) => vertex_arrays.unset_attribute(location),
+            C::SetVertexArrayIndexBuffer(buffer) => vertex_arrays.set_index_buffer(buffer),
+            C::ResetVertexArray => unsafe { vertex_arrays.reset(gl) },
             C::SetVertexBuffer {
                 index,
                 ref buffer,
@@ -1515,82 +1499,8 @@ impl super::Queue {
             }
             C::SetColorTarget {
                 draw_buffer_index,
-                desc: super::ColorTargetDesc { mask, ref blend },
-            } => {
-                use wgt::ColorWrites as Cw;
-                if let Some(index) = draw_buffer_index {
-                    unsafe {
-                        gl.color_mask_draw_buffer(
-                            index,
-                            mask.contains(Cw::RED),
-                            mask.contains(Cw::GREEN),
-                            mask.contains(Cw::BLUE),
-                            mask.contains(Cw::ALPHA),
-                        )
-                    };
-                    if let Some(ref blend) = *blend {
-                        unsafe { gl.enable_draw_buffer(glow::BLEND, index) };
-                        if blend.color != blend.alpha {
-                            unsafe {
-                                gl.blend_equation_separate_draw_buffer(
-                                    index,
-                                    blend.color.equation,
-                                    blend.alpha.equation,
-                                )
-                            };
-                            unsafe {
-                                gl.blend_func_separate_draw_buffer(
-                                    index,
-                                    blend.color.src,
-                                    blend.color.dst,
-                                    blend.alpha.src,
-                                    blend.alpha.dst,
-                                )
-                            };
-                        } else {
-                            unsafe { gl.blend_equation_draw_buffer(index, blend.color.equation) };
-                            unsafe {
-                                gl.blend_func_draw_buffer(index, blend.color.src, blend.color.dst)
-                            };
-                        }
-                    } else {
-                        unsafe { gl.disable_draw_buffer(glow::BLEND, index) };
-                    }
-                } else {
-                    unsafe {
-                        gl.color_mask(
-                            mask.contains(Cw::RED),
-                            mask.contains(Cw::GREEN),
-                            mask.contains(Cw::BLUE),
-                            mask.contains(Cw::ALPHA),
-                        )
-                    };
-                    if let Some(ref blend) = *blend {
-                        unsafe { gl.enable(glow::BLEND) };
-                        if blend.color != blend.alpha {
-                            unsafe {
-                                gl.blend_equation_separate(
-                                    blend.color.equation,
-                                    blend.alpha.equation,
-                                )
-                            };
-                            unsafe {
-                                gl.blend_func_separate(
-                                    blend.color.src,
-                                    blend.color.dst,
-                                    blend.alpha.src,
-                                    blend.alpha.dst,
-                                )
-                            };
-                        } else {
-                            unsafe { gl.blend_equation(blend.color.equation) };
-                            unsafe { gl.blend_func(blend.color.src, blend.color.dst) };
-                        }
-                    } else {
-                        unsafe { gl.disable(glow::BLEND) };
-                    }
-                }
-            }
+                ref desc,
+            } => unsafe { set_color_target(gl, draw_buffer_index, desc) },
             C::BindBuffer {
                 target,
                 slot,
@@ -1941,6 +1851,8 @@ impl crate::Queue for super::Queue {
     ) -> Result<(), crate::DeviceError> {
         let shared = Arc::clone(&self.shared);
         let gl = &shared.context.lock();
+        let mut vertex_arrays = self.vertex_arrays.lock();
+        vertex_arrays.begin_submit();
         for cmd_buf in command_buffers.iter() {
             // The command encoder assumes a default state when encoding the command buffer.
             // Always reset the state between command_buffers to reflect this assumption. Do
@@ -1970,7 +1882,15 @@ impl crate::Queue for super::Queue {
             }
 
             for command in cmd_buf.commands.iter() {
-                unsafe { self.process(gl, command, &cmd_buf.data_bytes, &cmd_buf.queries) };
+                unsafe {
+                    self.process(
+                        gl,
+                        command,
+                        &cmd_buf.data_bytes,
+                        &cmd_buf.queries,
+                        &mut vertex_arrays,
+                    )
+                };
             }
 
             if cmd_buf.label.is_some()
@@ -1982,6 +1902,9 @@ impl crate::Queue for super::Queue {
                 unsafe { gl.pop_debug_group() };
             }
         }
+
+        unsafe { vertex_arrays.end_submit(gl) };
+        drop(vertex_arrays);
 
         signal_fence.maintain(gl);
         signal_fence.signal(gl, signal_value)?;
@@ -2018,3 +1941,79 @@ impl crate::Queue for super::Queue {
 unsafe impl Sync for super::Queue {}
 #[cfg(send_sync)]
 unsafe impl Send for super::Queue {}
+
+/// Color write mask and blend of one target, or of all targets when `draw_buffer_index` is
+/// `None`; shared with the pipeline warm-up so its draw keys the same pipeline state.
+pub(super) unsafe fn set_color_target(
+    gl: &glow::Context,
+    draw_buffer_index: Option<u32>,
+    desc: &super::ColorTargetDesc,
+) {
+    let super::ColorTargetDesc { mask, ref blend } = *desc;
+    use wgt::ColorWrites as Cw;
+    if let Some(index) = draw_buffer_index {
+        unsafe {
+            gl.color_mask_draw_buffer(
+                index,
+                mask.contains(Cw::RED),
+                mask.contains(Cw::GREEN),
+                mask.contains(Cw::BLUE),
+                mask.contains(Cw::ALPHA),
+            )
+        };
+        if let Some(ref blend) = *blend {
+            unsafe { gl.enable_draw_buffer(glow::BLEND, index) };
+            if blend.color != blend.alpha {
+                unsafe {
+                    gl.blend_equation_separate_draw_buffer(
+                        index,
+                        blend.color.equation,
+                        blend.alpha.equation,
+                    )
+                };
+                unsafe {
+                    gl.blend_func_separate_draw_buffer(
+                        index,
+                        blend.color.src,
+                        blend.color.dst,
+                        blend.alpha.src,
+                        blend.alpha.dst,
+                    )
+                };
+            } else {
+                unsafe { gl.blend_equation_draw_buffer(index, blend.color.equation) };
+                unsafe { gl.blend_func_draw_buffer(index, blend.color.src, blend.color.dst) };
+            }
+        } else {
+            unsafe { gl.disable_draw_buffer(glow::BLEND, index) };
+        }
+    } else {
+        unsafe {
+            gl.color_mask(
+                mask.contains(Cw::RED),
+                mask.contains(Cw::GREEN),
+                mask.contains(Cw::BLUE),
+                mask.contains(Cw::ALPHA),
+            )
+        };
+        if let Some(ref blend) = *blend {
+            unsafe { gl.enable(glow::BLEND) };
+            if blend.color != blend.alpha {
+                unsafe { gl.blend_equation_separate(blend.color.equation, blend.alpha.equation) };
+                unsafe {
+                    gl.blend_func_separate(
+                        blend.color.src,
+                        blend.color.dst,
+                        blend.alpha.src,
+                        blend.alpha.dst,
+                    )
+                };
+            } else {
+                unsafe { gl.blend_equation(blend.color.equation) };
+                unsafe { gl.blend_func(blend.color.src, blend.color.dst) };
+            }
+        } else {
+            unsafe { gl.disable(glow::BLEND) };
+        }
+    }
+}
