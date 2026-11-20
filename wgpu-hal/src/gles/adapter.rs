@@ -1128,6 +1128,8 @@ impl crate::Adapter for super::Adapter {
                 vertex_arrays: Arc::clone(&vertex_arrays),
                 #[cfg(webgl)]
                 warm: Mutex::new(Default::default()),
+                #[cfg(webgl)]
+                shader_stages: Mutex::new(Default::default()),
                 #[cfg(all(native, feature = "renderdoc"))]
                 render_doc: Default::default(),
                 counters: Default::default(),
