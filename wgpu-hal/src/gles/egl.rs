@@ -494,6 +494,12 @@ impl Inner {
         } else {
             false
         };
+        // An explicit GLES minor version can only be honored by an OpenGL ES context.
+        let use_opengl =
+            supports_opengl && force_gles_minor_version == wgt::Gles3MinorVersion::Automatic;
+        if supports_opengl && !use_opengl {
+            log::debug!("\tEGL context: GLES 3 minor version requested, not using desktop OpenGL");
+        }
 
         let mut khr_context_flags = 0;
         let supports_khr_context = display_extensions.contains("EGL_KHR_create_context");
@@ -505,9 +511,6 @@ impl Inner {
         gl_context_attributes.push(3);
         gl_context_attributes.push(khronos_egl::CONTEXT_MINOR_VERSION);
         gl_context_attributes.push(3);
-        if supports_opengl && force_gles_minor_version != wgt::Gles3MinorVersion::Automatic {
-            log::warn!("Ignoring specified GLES minor version as OpenGL is used");
-        }
         gles_context_attributes.push(khronos_egl::CONTEXT_MAJOR_VERSION);
         gles_context_attributes.push(3); // Request GLES 3.0 or higher
         if force_gles_minor_version != wgt::Gles3MinorVersion::Automatic {
@@ -621,7 +624,7 @@ impl Inner {
                 }
             };
 
-            let result = if supports_opengl {
+            let result = if use_opengl {
                 create_context(khronos_egl::OPENGL_API, &gl_context_attributes).or_else(
                     |gl_error| {
                         log::debug!("Failed to create desktop OpenGL context: {gl_error}, falling back to OpenGL ES");

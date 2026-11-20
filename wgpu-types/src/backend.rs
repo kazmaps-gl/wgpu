@@ -266,9 +266,15 @@ impl BackendOptions {
 #[derive(Clone, Debug, Eq, PartialEq, ConstDefault!)]
 pub struct GlBackendOptions {
     /// Which OpenGL ES 3 minor version to request, if using OpenGL ES.
+    ///
+    /// With EGL, anything other than [`Gles3MinorVersion::Automatic`] creates an OpenGL ES
+    /// context even when the display also offers desktop OpenGL.
     pub gles_minor_version: Gles3MinorVersion,
     /// Behavior of OpenGL fences. Affects how `on_completed_work_done` and `device.poll` behave.
     pub fence_behavior: GlFenceBehavior,
+    /// How an asynchronously created WebGL program waits for its link when the context has
+    /// no `KHR_parallel_shader_compile`.
+    pub link_wait: GlLinkWait,
     /// Controls whether debug functions (`glPushDebugGroup`, `glPopDebugGroup`,
     /// `glObjectLabel`, etc.) are enabled when supported by the driver.
     ///
@@ -296,6 +302,7 @@ impl GlBackendOptions {
         Self {
             gles_minor_version,
             fence_behavior: GlFenceBehavior::Normal,
+            link_wait: GlLinkWait::from_env().unwrap_or_default(),
             debug_fns,
         }
     }
@@ -307,10 +314,12 @@ impl GlBackendOptions {
     pub fn with_env(self) -> Self {
         let gles_minor_version = self.gles_minor_version.with_env();
         let fence_behavior = self.fence_behavior.with_env();
+        let link_wait = self.link_wait.with_env();
         let debug_fns = self.debug_fns.with_env();
         Self {
             gles_minor_version,
             fence_behavior,
+            link_wait,
             debug_fns,
         }
     }
@@ -973,6 +982,49 @@ impl Gles3MinorVersion {
         } else {
             self
         }
+    }
+}
+
+/// How `Device::create_render_pipeline_async` waits for a WebGL program to link when the
+/// context has no `KHR_parallel_shader_compile`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ConstDefault!)]
+pub enum GlLinkWait {
+    /// Create the pipeline synchronously: the link status query blocks until the program is linked.
+    #[custom(default)]
+    Immediate,
+    /// Flush the link, then poll a fence placed after it between yields before querying the
+    /// link status.
+    ///
+    /// For a browser that links in another process, does not start the link before a flush and
+    /// answers fence queries without waiting for that process (Firefox). Where fence queries are
+    /// themselves synchronous round trips, this gains nothing.
+    FencePoll,
+}
+
+impl GlLinkWait {
+    /// Choose the link wait from the environment variable `WGPU_GL_LINK_WAIT`.
+    ///
+    /// Possible values are `Immediate` or `FencePoll`. Case insensitive.
+    ///
+    /// Use with `unwrap_or_default()` to get the default value if the environment variable is not set.
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        let value = crate::env::var("WGPU_GL_LINK_WAIT")
+            .as_deref()?
+            .to_lowercase();
+        match value.as_str() {
+            "immediate" => Some(Self::Immediate),
+            "fencepoll" => Some(Self::FencePoll),
+            _ => None,
+        }
+    }
+
+    /// Takes the given link wait, modifies it based on the `WGPU_GL_LINK_WAIT` environment variable, and returns the result.
+    ///
+    /// See `from_env` for more information.
+    #[must_use]
+    pub fn with_env(self) -> Self {
+        Self::from_env().unwrap_or(self)
     }
 }
 

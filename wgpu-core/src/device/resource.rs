@@ -4734,9 +4734,37 @@ impl Device {
         }
     }
 
+    /// Compiles through the HAL's asynchronous path on browser GLES.
+    #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+    pub async fn create_render_pipeline_async_or_error(
+        self: &Arc<Self>,
+        desc: pipeline::ResolvedGeneralRenderPipelineDescriptor<'_>,
+    ) -> Result<Arc<pipeline::RenderPipeline>, pipeline::CreatePipelineError> {
+        let label = desc.label.to_string();
+        match self.create_render_pipeline_inner(desc, true).await {
+            Err(e) if e.webgpu_error_type() == wgt::error::ErrorType::DeviceLost => {
+                Ok(pipeline::RenderPipeline::invalid(self.clone(), label))
+            }
+            result => result,
+        }
+    }
+
     fn create_render_pipeline_or_error_inner(
         self: &Arc<Self>,
         desc: pipeline::ResolvedGeneralRenderPipelineDescriptor,
+    ) -> Result<Arc<pipeline::RenderPipeline>, pipeline::CreatePipelineError> {
+        let mut future = core::pin::pin!(self.create_render_pipeline_inner(desc, false));
+        let mut context = core::task::Context::from_waker(core::task::Waker::noop());
+        match core::future::Future::poll(future.as_mut(), &mut context) {
+            core::task::Poll::Ready(result) => result,
+            core::task::Poll::Pending => unreachable!("synchronous pipeline creation yielded"),
+        }
+    }
+
+    async fn create_render_pipeline_inner(
+        self: &Arc<Self>,
+        desc: pipeline::ResolvedGeneralRenderPipelineDescriptor<'_>,
+        _asynchronous: bool,
     ) -> Result<Arc<pipeline::RenderPipeline>, pipeline::CreatePipelineError> {
         use wgt::TextureFormatFeatureFlags as Tfff;
 
@@ -5347,10 +5375,22 @@ impl Device {
                 multiview_mask: desc.multiview_mask,
                 cache: cache.as_ref().map(|it| it.raw()).transpose()?,
             };
-            unsafe { self.raw().create_render_pipeline(&pipeline_desc) }
-                .map_err(|err| self.handle_hal_pipeline_error(err))?
+            #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+            let raw = if _asynchronous {
+                unsafe { self.raw().create_render_pipeline_async(&pipeline_desc) }.await
+            } else {
+                unsafe { self.raw().create_render_pipeline(&pipeline_desc) }
+            };
+            #[cfg(not(all(target_arch = "wasm32", not(target_os = "emscripten"))))]
+            let raw = unsafe { self.raw().create_render_pipeline(&pipeline_desc) };
+            raw.map_err(|err| self.handle_hal_pipeline_error(err))?
         };
         drop((vertex_stage, task_stage, mesh_stage, fragment_stage));
+
+        if let Err(error) = self.check_is_valid() {
+            unsafe { self.raw().destroy_render_pipeline(raw) };
+            return Err(error.into());
+        }
 
         let pass_context = RenderPassContext {
             attachments: AttachmentData {
