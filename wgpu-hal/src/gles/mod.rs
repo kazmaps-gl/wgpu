@@ -100,6 +100,11 @@ mod emscripten;
 
 mod fence;
 mod queue;
+#[cfg(any(webgl, all(test, native)))]
+mod stage_cache;
+mod vertex_array;
+#[cfg(webgl)]
+mod warm;
 
 #[cfg(webgl)]
 mod web;
@@ -275,7 +280,7 @@ bitflags::bitflags! {
 
 type BindTarget = u32;
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 enum VertexAttribKind {
     #[default]
     Float, // glVertexAttribPointer
@@ -345,7 +350,11 @@ pub struct Adapter {
 #[derive(Debug)]
 pub struct Device {
     shared: Arc<AdapterShared>,
-    main_vao: glow::VertexArray,
+    vertex_arrays: Arc<Mutex<vertex_array::VertexArrays>>,
+    #[cfg(webgl)]
+    warm: Mutex<warm::Warm>,
+    #[cfg(webgl)]
+    shader_stages: Mutex<stage_cache::StageCache>,
     #[cfg(all(native, feature = "renderdoc"))]
     render_doc: crate::auxil::renderdoc::RenderDoc,
     counters: Arc<wgt::HalCounters>,
@@ -354,7 +363,14 @@ pub struct Device {
 impl Drop for Device {
     fn drop(&mut self) {
         let gl = &self.shared.context.lock();
-        unsafe { gl.delete_vertex_array(self.main_vao) };
+        unsafe { self.vertex_arrays.lock().delete(gl) };
+        #[cfg(webgl)]
+        unsafe {
+            self.warm.lock().delete(gl);
+            for shader in self.shader_stages.get_mut().drain() {
+                gl.delete_shader(shader);
+            }
+        };
     }
 }
 
@@ -379,6 +395,7 @@ pub struct Queue {
     temp_query_results: Mutex<Vec<u64>>,
     draw_buffer_count: AtomicU8,
     current_index_buffer: Mutex<Option<glow::Buffer>>,
+    vertex_arrays: Arc<Mutex<vertex_array::VertexArrays>>,
 }
 
 impl Drop for Queue {
@@ -394,6 +411,8 @@ impl Drop for Queue {
 pub struct Buffer {
     raw: Option<glow::Buffer>,
     target: BindTarget,
+    /// Has `VERTEX` or `INDEX` usage, so a cached vertex array object may refer to it.
+    vertex_input: bool,
     /// Flags to use within calls to [`Device::map_buffer`](crate::Device::map_buffer).
     map_flags: u32,
     /// Buffer mapping state.
@@ -648,7 +667,7 @@ pub struct ShaderModule {
 
 impl crate::DynShaderModule for ShaderModule {}
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 struct VertexFormatDesc {
     element_count: i32,
     element_format: u32,
@@ -1008,17 +1027,21 @@ enum Command {
     SetDepthBias(wgt::DepthBiasState),
     ConfigureDepthStencil(crate::FormatAspects),
     SetAlphaToCoverage(bool),
-    SetVertexAttribute {
-        buffer: Option<glow::Buffer>,
-        buffer_desc: VertexBufferDesc,
-        attribute_desc: AttributeDesc,
-    },
+    /// With `VERTEX_BUFFER_LAYOUT`: enables an attribute and sets its format and binding.
+    SetVertexAttribute(AttributeDesc),
     UnsetVertexAttribute(u32),
     SetVertexBuffer {
         index: u32,
         buffer: BufferBinding,
         buffer_desc: VertexBufferDesc,
     },
+    /// Without `VERTEX_BUFFER_LAYOUT`: the attributes and index buffer the next draws read,
+    /// which the queue resolves to a vertex array object at the draw.
+    SetVertexArrayAttribute(vertex_array::VertexAttribute),
+    UnsetVertexArrayAttribute(u32),
+    SetVertexArrayIndexBuffer(glow::Buffer),
+    /// Ends a render pass on that path: binds the main vertex array object back.
+    ResetVertexArray,
     SetProgram(glow::Program),
     SetPrimitive(PrimitiveState),
     SetBlendConstant([f32; 4]),

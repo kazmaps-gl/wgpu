@@ -80,9 +80,8 @@ pub struct Mutex<T> {
 /// For details, see [the module documentation][self].
 pub struct MutexGuard<'a, T> {
     inner: wgpu_sync::MutexGuard<'a, T>,
-    // Never read, but `Drop` has important side effects.
-    #[cfg_attr(all(wgpu_validate_locks, not(miri)), expect(unused))]
-    saved: LockStateGuard,
+    // Drop restores the rank after the underlying guard releases the lock.
+    _saved: LockStateGuard,
 }
 
 std::thread_local! {
@@ -232,7 +231,7 @@ impl<T> Mutex<T> {
         let saved = acquire(self.rank, Location::caller());
         MutexGuard {
             inner: self.inner.lock(),
-            saved: LockStateGuard(saved),
+            _saved: LockStateGuard(saved),
         }
     }
 
@@ -291,9 +290,8 @@ pub struct RwLockReadGuard<'a, T> {
 /// For details, see [the module documentation][self].
 pub struct RwLockWriteGuard<'a, T> {
     inner: wgpu_sync::RwLockWriteGuard<'a, T>,
-    // Never read, but `Drop` has important side effects.
-    #[cfg_attr(all(wgpu_validate_locks, not(miri)), expect(unused))]
-    saved: LockStateGuard,
+    // Drop restores the rank after the underlying guard releases the lock.
+    _saved: LockStateGuard,
 }
 
 impl<T> RwLock<T> {
@@ -318,7 +316,7 @@ impl<T> RwLock<T> {
         let saved = acquire(self.rank, Location::caller());
         RwLockWriteGuard {
             inner: self.inner.write(),
-            saved: LockStateGuard(saved),
+            _saved: LockStateGuard(saved),
         }
     }
 

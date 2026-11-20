@@ -284,6 +284,33 @@ impl Device {
         RenderPipeline { inner: pipeline }
     }
 
+    /// Creates a [`RenderPipeline`] without blocking the calling thread on shader
+    /// compilation, where the backend is able to avoid it.
+    ///
+    /// On WebGPU this calls [`GPUDevice.createRenderPipelineAsync()`], which lets the
+    /// browser compile the pipeline off the GPU process' main thread, and which reports
+    /// a failure by rejecting: a validation or internal error is delivered as the `Err`
+    /// of the returned future instead of going to the current error scope or the
+    /// uncaptured error handler.
+    ///
+    /// On WebGL, `KHR_parallel_shader_compile` is used when available: linking is
+    /// polled without blocking, and failures are returned by the future. Without the
+    /// extension, WebGL falls back to synchronous compilation when the future is polled.
+    ///
+    /// Every native backend has no asynchronous form of pipeline creation: it behaves
+    /// exactly like [`Device::create_render_pipeline`], the returned future is already
+    /// resolved and always `Ok`, and errors arrive through [`Device::push_error_scope`]
+    /// or [`Device::on_uncaptured_error`] as usual.
+    ///
+    /// [`GPUDevice.createRenderPipelineAsync()`]: https://developer.mozilla.org/en-US/docs/Web/API/GPUDevice/createRenderPipelineAsync
+    pub fn create_render_pipeline_async(
+        &self,
+        desc: &RenderPipelineDescriptor<'_>,
+    ) -> impl Future<Output = Result<RenderPipeline, Error>> + WasmNotSend + 'static {
+        let pipeline = self.inner.create_render_pipeline_async(desc);
+        async move { pipeline.await.map(|inner| RenderPipeline { inner }) }
+    }
+
     /// Creates a mesh shader based [`RenderPipeline`].
     #[must_use]
     pub fn create_mesh_pipeline(&self, desc: &MeshPipelineDescriptor<'_>) -> RenderPipeline {
@@ -306,6 +333,31 @@ impl Device {
     ) -> RayTracingPipeline {
         let pipeline = self.inner.create_ray_tracing_pipeline(desc);
         RayTracingPipeline { inner: pipeline }
+    }
+
+    /// Creates a [`ComputePipeline`] without blocking the calling thread on shader
+    /// compilation, where the backend is able to avoid it.
+    ///
+    /// On WebGPU this calls [`GPUDevice.createComputePipelineAsync()`]. A synchronous
+    /// `createComputePipeline()` can make the browser compile the shader on the GPU
+    /// process' main thread, stalling every page's WebGPU work behind it; the
+    /// asynchronous form lets the browser compile elsewhere. Failure is reported by
+    /// rejecting: a validation or internal error is delivered as the `Err` of the
+    /// returned future instead of going to the current error scope or the uncaptured
+    /// error handler.
+    ///
+    /// Every other backend has no asynchronous form of compute pipeline creation: it
+    /// behaves exactly like [`Device::create_compute_pipeline`], the returned future is
+    /// already resolved and always `Ok`, and errors arrive through
+    /// [`Device::push_error_scope`] or [`Device::on_uncaptured_error`] as usual.
+    ///
+    /// [`GPUDevice.createComputePipelineAsync()`]: https://developer.mozilla.org/en-US/docs/Web/API/GPUDevice/createComputePipelineAsync
+    pub fn create_compute_pipeline_async(
+        &self,
+        desc: &ComputePipelineDescriptor<'_>,
+    ) -> impl Future<Output = Result<ComputePipeline, Error>> + WasmNotSend + 'static {
+        let pipeline = self.inner.create_compute_pipeline_async(desc);
+        async move { pipeline.await.map(|inner| ComputePipeline { inner }) }
     }
 
     /// Creates a [`Buffer`].

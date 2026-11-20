@@ -3,7 +3,31 @@ use core::{mem, ops::Range};
 
 use arrayvec::ArrayVec;
 
-use super::{conv, Command as C};
+use super::{
+    conv,
+    vertex_array::{AttributePointer, VertexAttribute},
+    Command as C,
+};
+
+/// A buffer binding already recorded in the current pass. WebGL2 pays a JS call per
+/// redundant `bindBufferRange`, so identical rebinds are dropped at encode time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BoundBuffer {
+    target: u32,
+    slot: u32,
+    raw: glow::Buffer,
+    offset: i32,
+    size: i32,
+}
+
+/// A texture binding already recorded in the current pass (see [`BoundBuffer`]).
+#[derive(Clone, Debug, PartialEq)]
+struct BoundTexture {
+    raw: glow::Texture,
+    target: super::BindTarget,
+    aspects: crate::FormatAspects,
+    mip_levels: Range<u32>,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct TextureSlotDesc {
@@ -40,6 +64,19 @@ pub(super) struct State {
     current_immediates_data: [u32; super::MAX_IMMEDIATES],
     end_of_pass_timestamp: Option<glow::Query>,
     clip_distance_count: u32,
+    // Binding caches, valid only inside one pass: copies between passes rebind freely.
+    bound_buffers: ArrayVec<BoundBuffer, 32>,
+    bound_textures: [Option<BoundTexture>; super::MAX_TEXTURE_SLOTS],
+    /// Sampler recorded per texture unit; the outer `None` means unknown.
+    bound_samplers: [Option<Option<glow::Sampler>>; super::MAX_TEXTURE_SLOTS],
+}
+
+impl State {
+    fn forget_bindings(&mut self) {
+        self.bound_buffers.clear();
+        self.bound_textures = Default::default();
+        self.bound_samplers = Default::default();
+    }
 }
 
 impl Default for State {
@@ -69,6 +106,9 @@ impl Default for State {
             current_immediates_data: [0; super::MAX_IMMEDIATES],
             end_of_pass_timestamp: Default::default(),
             clip_distance_count: Default::default(),
+            bound_buffers: Default::default(),
+            bound_textures: Default::default(),
+            bound_samplers: Default::default(),
         }
     }
 }
@@ -173,17 +213,22 @@ impl super::CommandEncoder {
                         (_, _) => continue,
                     };
 
-                let mut attribute_desc = attribute.clone();
-                attribute_desc.offset += vb.offset as u32;
+                let mut offset = attribute.offset + vb.offset as u32;
                 if buffer_desc.step == wgt::VertexStepMode::Instance {
-                    attribute_desc.offset += buffer_desc.stride * first_instance;
+                    offset += buffer_desc.stride * first_instance;
                 }
-
-                self.cmd_buffer.commands.push(C::SetVertexAttribute {
-                    buffer: Some(vb.raw),
-                    buffer_desc,
-                    attribute_desc,
-                });
+                self.cmd_buffer
+                    .commands
+                    .push(C::SetVertexArrayAttribute(VertexAttribute {
+                        location: attribute.location,
+                        pointer: AttributePointer {
+                            buffer: vb.raw,
+                            format: attribute.format_desc.clone(),
+                            stride: buffer_desc.stride,
+                            offset,
+                        },
+                        divisor: buffer_desc.step as u32,
+                    }));
                 vbuf_mask |= 1 << attribute.buffer_index;
             }
             self.state.dirty_vbuf_mask ^= vbuf_mask;
@@ -200,6 +245,10 @@ impl super::CommandEncoder {
                 let sampler = slot
                     .sampler_index
                     .and_then(|si| self.state.samplers[si as usize]);
+                if self.state.bound_samplers[texture_index] == Some(sampler) {
+                    continue;
+                }
+                self.state.bound_samplers[texture_index] = Some(sampler);
                 self.cmd_buffer
                     .commands
                     .push(C::BindSampler(texture_index as u32, sampler));
@@ -509,6 +558,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 .map(|index| t.query_set.queries[index as usize]);
         }
 
+        self.state.forget_bindings();
         self.state.render_size = desc.extent;
         self.state.resolve_attachments.clear();
         self.state.invalidate_attachments.clear();
@@ -718,13 +768,21 @@ impl crate::CommandEncoder for super::CommandEncoder {
         self.state.dirty_vbuf_mask = 0;
         self.state.active_first_instance = 0;
         self.state.color_targets.clear();
-        for vat in &self.state.vertex_attributes {
-            self.cmd_buffer
-                .commands
-                .push(C::UnsetVertexAttribute(vat.location));
+        if self
+            .private_caps
+            .contains(super::PrivateCapabilities::VERTEX_BUFFER_LAYOUT)
+        {
+            for vat in &self.state.vertex_attributes {
+                self.cmd_buffer
+                    .commands
+                    .push(C::UnsetVertexAttribute(vat.location));
+            }
+        } else {
+            self.cmd_buffer.commands.push(C::ResetVertexArray);
         }
         self.state.vertex_attributes.clear();
         self.state.primitive = super::PrimitiveState::default();
+        self.state.forget_bindings();
 
         if let Some(query) = self.state.end_of_pass_timestamp.take() {
             self.cmd_buffer.commands.push(C::TimestampQuery(query));
@@ -771,6 +829,25 @@ impl crate::CommandEncoder for super::CommandEncoder {
                         }
                         _ => unreachable!(),
                     };
+                    let bound = BoundBuffer {
+                        target,
+                        slot,
+                        raw,
+                        offset,
+                        size,
+                    };
+                    let cached = self
+                        .state
+                        .bound_buffers
+                        .iter_mut()
+                        .find(|b| b.target == target && b.slot == slot);
+                    match cached {
+                        Some(b) if *b == bound => continue,
+                        Some(b) => *b = bound,
+                        None => {
+                            let _ = self.state.bound_buffers.try_push(bound);
+                        }
+                    }
                     self.cmd_buffer.commands.push(C::BindBuffer {
                         target,
                         slot,
@@ -780,8 +857,10 @@ impl crate::CommandEncoder for super::CommandEncoder {
                     });
                 }
                 super::RawBinding::Sampler(sampler) => {
-                    dirty_samplers |= 1 << slot;
-                    self.state.samplers[slot as usize] = Some(sampler);
+                    if self.state.samplers[slot as usize] != Some(sampler) {
+                        dirty_samplers |= 1 << slot;
+                        self.state.samplers[slot as usize] = Some(sampler);
+                    }
                 }
                 super::RawBinding::Texture {
                     raw,
@@ -789,6 +868,23 @@ impl crate::CommandEncoder for super::CommandEncoder {
                     aspects,
                     ref mip_levels,
                 } => {
+                    let bound = BoundTexture {
+                        raw,
+                        target,
+                        aspects,
+                        mip_levels: mip_levels.clone(),
+                    };
+                    if self.state.bound_textures[slot as usize].as_ref() == Some(&bound) {
+                        continue;
+                    }
+                    // The mip range lives on the texture object: any other unit holding the
+                    // same texture must re-apply its own range on its next bind.
+                    for other in self.state.bound_textures.iter_mut() {
+                        if other.as_ref().is_some_and(|o| o.raw == raw) {
+                            *other = None;
+                        }
+                    }
+                    self.state.bound_textures[slot as usize] = Some(bound);
                     dirty_textures |= 1 << slot;
                     self.state.texture_slots[slot as usize].tex_target = target;
                     self.cmd_buffer.commands.push(C::BindTexture {
@@ -877,21 +973,23 @@ impl crate::CommandEncoder for super::CommandEncoder {
             .contains(super::PrivateCapabilities::VERTEX_BUFFER_LAYOUT)
         {
             for vat in pipeline.vertex_attributes.iter() {
-                let vb = pipeline.vertex_buffers[vat.buffer_index as usize]
-                    .as_ref()
-                    .unwrap();
                 // set the layout
-                self.cmd_buffer.commands.push(C::SetVertexAttribute {
-                    buffer: None,
-                    buffer_desc: vb.clone(),
-                    attribute_desc: vat.clone(),
-                });
-            }
-        } else {
-            for vat in &self.state.vertex_attributes {
                 self.cmd_buffer
                     .commands
-                    .push(C::UnsetVertexAttribute(vat.location));
+                    .push(C::SetVertexAttribute(vat.clone()));
+            }
+        } else {
+            // Locations the new pipeline reads get their attribute at the next draw.
+            let next = pipeline
+                .vertex_attributes
+                .iter()
+                .fold(0u32, |mask, vat| mask | 1 << vat.location);
+            for vat in &self.state.vertex_attributes {
+                if next & (1 << vat.location) == 0 {
+                    self.cmd_buffer
+                        .commands
+                        .push(C::UnsetVertexArrayAttribute(vat.location));
+                }
             }
             self.state.vertex_attributes.clear();
 
@@ -1028,9 +1126,17 @@ impl crate::CommandEncoder for super::CommandEncoder {
     ) {
         self.state.index_offset = binding.offset;
         self.state.index_format = format;
-        self.cmd_buffer
-            .commands
-            .push(C::SetIndexBuffer(binding.buffer.raw.unwrap()));
+        let raw = binding.buffer.raw.unwrap();
+        self.cmd_buffer.commands.push(
+            if self
+                .private_caps
+                .contains(super::PrivateCapabilities::VERTEX_BUFFER_LAYOUT)
+            {
+                C::SetIndexBuffer(raw)
+            } else {
+                C::SetVertexArrayIndexBuffer(raw)
+            },
+        );
     }
     unsafe fn set_vertex_buffer<'a>(
         &mut self,
@@ -1236,8 +1342,10 @@ impl crate::CommandEncoder for super::CommandEncoder {
             self.cmd_buffer.commands.push(C::PushDebugGroup(range));
             self.state.has_pass_label = true;
         }
+        self.state.forget_bindings();
     }
     unsafe fn end_compute_pass(&mut self) {
+        self.state.forget_bindings();
         if self.state.has_pass_label {
             self.cmd_buffer.commands.push(C::PopDebugGroup);
             self.state.has_pass_label = false;
