@@ -28,16 +28,65 @@ type ShaderStage<'a> = (
 );
 type NameBindingMap = FastHashMap<String, (super::BindingRegister, u8)>;
 
+struct NewShader {
+    raw: glow::Shader,
+    #[cfg(webgl)]
+    key: Option<super::stage_cache::Key>,
+}
+
 struct ProgramObjects<'a> {
     gl: &'a glow::Context,
     program: Option<glow::Program>,
-    shaders: ArrayVec<glow::Shader, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
+    shaders: ArrayVec<NewShader, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
+    #[cfg(webgl)]
+    cache: &'a parking_lot::Mutex<super::stage_cache::StageCache>,
+}
+
+impl ProgramObjects<'_> {
+    fn attach(
+        &mut self,
+        stage: naga::ShaderStage,
+        source: Cow<'_, str>,
+        defer_status: bool,
+        label: Option<&str>,
+    ) -> Result<(), crate::PipelineError> {
+        let gl = self.gl;
+        let program = self.program.unwrap();
+        #[cfg(webgl)]
+        if let Some(shader) = self.cache.lock().get(stage, &source) {
+            unsafe { gl.attach_shader(program, shader) };
+            return Ok(());
+        }
+        let raw =
+            unsafe { super::Device::compile_shader(gl, defer_status, &source, stage, label) }?;
+        self.shaders.push(NewShader {
+            raw,
+            #[cfg(webgl)]
+            key: super::stage_cache::Key::new(stage, source),
+        });
+        unsafe { gl.attach_shader(program, raw) };
+        Ok(())
+    }
+
+    #[cfg(webgl)]
+    fn retain_linked_stages(&mut self) {
+        let mut cache = self.cache.lock();
+        for item in self.shaders.drain(..) {
+            let discarded = match item.key {
+                Some(key) => cache.insert(key, item.raw),
+                None => Some(item.raw),
+            };
+            if let Some(shader) = discarded {
+                unsafe { self.gl.delete_shader(shader) };
+            }
+        }
+    }
 }
 
 impl Drop for ProgramObjects<'_> {
     fn drop(&mut self) {
         for shader in self.shaders.drain(..) {
-            unsafe { self.gl.delete_shader(shader) };
+            unsafe { self.gl.delete_shader(shader.raw) };
         }
         if let Some(program) = self.program.take() {
             unsafe { self.gl.delete_program(program) };
@@ -336,15 +385,14 @@ impl super::Device {
         }
     }
 
-    fn create_shader(
-        gl: &glow::Context,
+    fn attach_shader(
+        objects: &mut ProgramObjects<'_>,
         naga_stage: naga::ShaderStage,
         stage: &crate::ProgrammableStage<super::ShaderModule>,
         context: CompilationContext,
-        program: glow::Program,
-    ) -> Result<glow::Shader, crate::PipelineError> {
+    ) -> Result<(), crate::PipelineError> {
         let defer_status = context.defer_status;
-        let source = 'outer: {
+        let source: Cow<'_, str> = 'outer: {
             use naga::back::glsl;
             let pipeline_options = glsl::PipelineOptions {
                 shader_stage: naga_stage,
@@ -357,7 +405,7 @@ impl super::Device {
             let naga = match stage.module.source {
                 super::ShaderModuleSource::Naga(ref naga) => naga,
                 super::ShaderModuleSource::Passthrough { ref source } => {
-                    break 'outer Cow::Borrowed(source);
+                    break 'outer Cow::Borrowed(source.as_str());
                 }
             };
 
@@ -380,7 +428,7 @@ impl super::Device {
 
             use naga::proc::BoundsCheckPolicy;
             // The image bounds checks require the TEXTURE_LEVELS feature available in GL core 4.3+.
-            let version = gl.version();
+            let version = objects.gl.version();
             let image_check = if !version.is_embedded && (version.major, version.minor) >= (4, 3) {
                 BoundsCheckPolicy::ReadZeroSkipWrite
             } else {
@@ -430,25 +478,22 @@ impl super::Device {
             log::debug!("Naga generated shader:\n{output}");
 
             context.consume_reflection(
-                gl,
+                objects.gl,
                 &module,
                 info.get_entry_point(entry_point_index),
                 reflection_info,
                 naga_stage,
-                program,
+                objects.program.unwrap(),
             );
             Cow::Owned(output)
         };
 
-        unsafe {
-            Self::compile_shader(
-                gl,
-                defer_status,
-                &source,
-                naga_stage,
-                stage.module.label.as_deref(),
-            )
-        }
+        objects.attach(
+            naga_stage,
+            source,
+            defer_status,
+            stage.module.label.as_deref(),
+        )
     }
 
     unsafe fn create_pipeline<'a>(
@@ -478,6 +523,8 @@ impl super::Device {
                     multiview_mask,
                     self.shared.shading_language_version,
                     self.shared.private_caps,
+                    #[cfg(webgl)]
+                    &self.shader_stages,
                 )
             })
             .to_owned()?;
@@ -530,6 +577,7 @@ impl super::Device {
         multiview_mask: Option<NonZeroU32>,
         glsl_version: naga::back::glsl::Version,
         private_caps: PrivateCapabilities,
+        #[cfg(webgl)] cache: &parking_lot::Mutex<super::stage_cache::StageCache>,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
         let pending = unsafe {
             Self::begin_program(
@@ -543,6 +591,8 @@ impl super::Device {
                     private_caps,
                     defer_status: false,
                 },
+                #[cfg(webgl)]
+                cache,
             )
         }?;
         unsafe { Self::finish_program(pending, private_caps) }
@@ -555,6 +605,7 @@ impl super::Device {
         #[cfg_attr(target_arch = "wasm32", allow(unused))] label: Option<&str>,
         multiview_mask: Option<NonZeroU32>,
         compilation: ProgramCompilation,
+        #[cfg(webgl)] cache: &'a parking_lot::Mutex<super::stage_cache::StageCache>,
     ) -> Result<PendingProgram<'a>, crate::PipelineError> {
         let ProgramCompilation {
             glsl_version,
@@ -570,6 +621,8 @@ impl super::Device {
             gl,
             program: Some(program),
             shaders: ArrayVec::new(),
+            #[cfg(webgl)]
+            cache,
         };
         #[cfg(native)]
         if let Some(label) = label {
@@ -601,28 +654,19 @@ impl super::Device {
                 defer_status,
             };
 
-            let shader = Self::create_shader(gl, naga_stage, stage, context, program)?;
-            objects.shaders.push(shader);
+            Self::attach_shader(&mut objects, naga_stage, stage, context)?;
         }
 
         // Create empty fragment shader if only vertex shader is present
         if has_stages == wgt::ShaderStages::VERTEX {
             let shader_src = format!("#version {glsl_version}\n void main(void) {{}}",);
             log::debug!("Only vertex shader is present. Creating an empty fragment shader",);
-            let shader = unsafe {
-                Self::compile_shader(
-                    gl,
-                    defer_status,
-                    &shader_src,
-                    naga::ShaderStage::Fragment,
-                    Some("(wgpu internal) dummy fragment shader"),
-                )
-            }?;
-            objects.shaders.push(shader);
-        }
-
-        for &shader in objects.shaders.iter() {
-            unsafe { gl.attach_shader(program, shader) };
+            objects.attach(
+                naga::ShaderStage::Fragment,
+                Cow::Owned(shader_src),
+                defer_status,
+                Some("(wgpu internal) dummy fragment shader"),
+            )?;
         }
         unsafe { gl.link_program(program) };
 
@@ -725,6 +769,8 @@ impl super::Device {
             None
         };
 
+        #[cfg(webgl)]
+        objects.retain_linked_stages();
         objects.program = None;
         Ok(Arc::new(super::PipelineInner {
             program,
@@ -1787,6 +1833,7 @@ impl crate::Device for super::Device {
                             private_caps: self.shared.private_caps,
                             defer_status: true,
                         },
+                        &self.shader_stages,
                     )
                 }?;
                 let fence = if fence_poll {

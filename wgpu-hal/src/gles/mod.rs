@@ -95,6 +95,8 @@ mod conv;
 mod device;
 mod fence;
 mod queue;
+#[cfg(any(webgl, all(test, native)))]
+mod stage_cache;
 mod vertex_array;
 #[cfg(webgl)]
 mod warm;
@@ -346,6 +348,8 @@ pub struct Device {
     vertex_arrays: Arc<Mutex<vertex_array::VertexArrays>>,
     #[cfg(webgl)]
     warm: Mutex<warm::Warm>,
+    #[cfg(webgl)]
+    shader_stages: Mutex<stage_cache::StageCache>,
     #[cfg(all(native, feature = "renderdoc"))]
     render_doc: crate::auxil::renderdoc::RenderDoc,
     counters: Arc<wgt::HalCounters>,
@@ -357,7 +361,10 @@ impl Drop for Device {
         unsafe { self.vertex_arrays.lock().delete(gl) };
         #[cfg(webgl)]
         unsafe {
-            self.warm.lock().delete(gl)
+            self.warm.lock().delete(gl);
+            for shader in self.shader_stages.get_mut().drain() {
+                gl.delete_shader(shader);
+            }
         };
     }
 }

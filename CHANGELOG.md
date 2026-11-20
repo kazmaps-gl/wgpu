@@ -72,6 +72,8 @@ Bottom level categories:
 
 #### GLES / OpenGL
 
+- On WebGL, creating another pipeline with an identical GLSL shader stage can reuse the
+  compiled shader from a previously linked program.
 - On WebGL, `create_render_pipeline_async` waits for `KHR_parallel_shader_compile`
   completion before checking link status and reflecting uniforms, avoiding shader
   compiler waits on the calling thread. Cancellation releases unfinished programs
